@@ -1,0 +1,104 @@
+---
+title: Delivery Framework
+description: A step-by-step flow for LLD/OOD interviews with example prompts.
+template: doc
+---
+
+## 1) Requirements (~5 minutes)
+
+- **Primary capabilities** — What operations must this system support?
+- **Rules and completion** — What conditions define success/failure or when the system stops/transitions state?
+- **Error handling** — How should the system respond to invalid inputs/actions?
+- **Scope boundaries** — What is in scope (core logic, rules) and explicitly out (UI, storage, networking, concurrency, extensibility)?
+- **Example: Tic Tac Toe**
+  - Requirements:
+    1. Two players alternate placing X and O on a 3x3 grid.
+    2. A player wins by completing a row, column, or diagonal.
+    3. The game ends in a draw if all nine cells are filled with no winner.
+    4. Invalid moves are rejected (occupied cell, acting after the game ends).
+    5. Provide a way to query game state and reset the game.
+  - Out of scope:
+    - UI/rendering layer
+    - AI opponent or move suggestions
+    - Networked multiplayer
+    - Variable board sizes (NxN)
+    - Undo/redo
+
+## 2) Entities and Relationships (~5 minutes)
+
+- **Entities**: Extract the key nouns from requirements. If something maintains changing state or enforces business rules, it’s likely an entity. If it’s just an attribute, it’s a field.
+- **Lifecycle check**: If it has its own lifecycle, it’s likely an entity.
+- **Relationship prompts**:
+  - Which entity orchestrates the main workflow (controller/service)?
+  - Which entities own durable state?
+  - How do they depend on each other (has-a/contains vs. uses/association)?
+    - has-a/contains: `ParkingLot` has-a `ParkingSpot`
+    - uses/association: `FeeCalculator` used by `ParkingService`
+  - Where do specific rules live?
+  - Example sketch:
+    - Entities: A, B, C
+    - Relationships: A → B (owns), A → C (uses)
+
+## 3) Class Design (~10–15 minutes)
+
+### Derive State from Requirements
+
+- Which parts of the requirements does this entity own?
+- What information must it keep in memory?
+- Example (Tic Tac Toe):
+  - “Two players alternate placing X and O on a 3x3 grid.”
+    - Track: 2 players, current player, board
+  - “The game ends when a player wins or the board is full.”
+    - Track: game state (IN_PROGRESS, WON, DRAW), winner?
+  - So `Game` fields might include:
+    - `board: Board`
+    - `playerX: Player`
+    - `playerO: Player`
+    - `currentPlayer: Player`
+    - `state: GameState`
+    - `winner: Player?`
+
+### Derive Behaviors from Requirements
+
+- Keep rules with the entity that owns the relevant state.
+- Example methods:
+  - `board.makeMove(player, col, row): boolean`
+  - `getCurrentPlayer(): Player`
+  - `getGameState(): GameState`
+  - `getWinner(): Player | null`
+  - `getBoard(): Board`
+
+## 4) Implementation (~10 minutes)
+
+- Ask the interviewer: high-level pseudocode or more complete code?
+- Cover both **happy path** and **edge cases** (invalid inputs, illegal operations, out-of-range values, state violations).
+- Pseudocode tip: be explicit and defensive. Example:
+
+```text
+makeMove(player, row, col):
+  if state != IN_PROGRESS: return false
+  if player != currentPlayer: return false
+  if !board.canPlace(row, col): return false
+
+  board.placeMark(row, col, player.mark)
+
+  if board.checkWin(row, col, player.mark):
+    state = WON
+    winner = player
+  else if board.isFull():
+    state = DRAW
+  else:
+    currentPlayer = switchPlayer()
+
+  return true
+```
+
+- Verification: take 1–2 minutes to dry run with sample inputs.
+
+## 5) Extensibility (~5 minutes if time)
+
+- Tailor depth to level (junior: none, mid: a couple, senior: more).
+- Example: adding **undo**
+  - All state transitions flow through a single action (`makeMove`).
+  - Add a **command history stack** capturing prior state before each successful action.
+  - `undo()` pops the stack and restores state; other components stay unchanged.

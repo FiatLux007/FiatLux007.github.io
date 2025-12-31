@@ -18,6 +18,8 @@ export default defineConfig({
           items: [
             { label: 'Overview', link: '/study-in-public-note/' },
             { label: 'LLD / OOD', link: '/study-in-public-note/lld/' },
+            { label: 'LLD / OOD · Introduction', link: '/study-in-public-note/lld/introduction/' },
+            { label: 'LLD / OOD · Delivery Framework', link: '/study-in-public-note/lld/delivery-framework/' },
             { label: 'Java Fundamentals', link: '/study-in-public-note/java-fundamentals/' },
             { label: 'Springboot', link: '/study-in-public-note/springboot/' },
             { label: 'Kafka', link: '/study-in-public-note/kafka/' },
