@@ -174,9 +174,16 @@ const frontmatter = {
     background-position: center;
     background-attachment: fixed;
     color: #eaeaea;
+    caret-color: transparent;
   }
 
   :global(.sl-container) {
     backdrop-filter: blur(2px);
+  }
+
+  :global(input),
+  :global(textarea),
+  :global([contenteditable='true']) {
+    caret-color: auto;
   }
 </style>
