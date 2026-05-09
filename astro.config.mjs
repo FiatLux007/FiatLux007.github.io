@@ -5,7 +5,7 @@ export default defineConfig({
   site: 'https://fiatlux007.github.io/',
   integrations: [
     starlight({
-      title: 'siyiGoMango!',
+      title: "Eva 's SpaceTime",
       description: 'Study in Public · Engineering Notes by Siyi',
       head: [],
       tableOfContents: false,
