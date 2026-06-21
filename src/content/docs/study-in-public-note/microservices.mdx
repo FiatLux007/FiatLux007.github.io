@@ -1,7 +1,710 @@
 ---
 title: Microservices
-description: Service design, communication, and reliability patterns.
+description: Study notes on microservice architecture, service boundaries, communication, API gateways, service discovery, security, observability, testing, and reliability patterns.
 template: doc
 ---
 
-Notes will include service boundaries, APIs, messaging, observability, and resiliency patterns.
+These are my study-in-public notes for microservice architecture. I use this page to organize the concepts that matter when designing backend systems: when microservices help, when they add unnecessary cost, how services communicate, how data ownership works, and what operational maturity is required before the architecture becomes useful.
+
+## What Are Microservices?
+
+Microservices are an architectural style where a system is split into small, independently deployable services. Each service owns a focused business capability, exposes a well-defined API, and can be developed, deployed, scaled, and operated independently.
+
+The key idea is not "many small apps." The key idea is independent ownership around business boundaries.
+
+A good microservice usually has:
+
+- a clear domain responsibility
+- its own data ownership
+- a stable API or event contract
+- independent deployability
+- observable runtime behavior
+- failure isolation from other services
+
+## Monolith vs Microservices
+
+A monolith is a single deployable application where multiple business functions live in one codebase and usually share one database.
+
+That is not automatically bad. A well-structured monolith can be simpler, faster to develop, easier to debug, and easier to test than a distributed system.
+
+Microservices become useful when the organization or product needs independent scaling, independent deployments, fault isolation, or separate team ownership across domains.
+
+| Dimension | Monolith | Microservices |
+| --- | --- | --- |
+| Deployment | One application deployed as a unit. | Each service can deploy independently. |
+| Scaling | Usually scale the whole app. | Scale hot services independently. |
+| Data | Often one shared database. | Each service owns its own data. |
+| Latency | In-process calls are fast. | Network calls add latency and failure modes. |
+| Testing | Simpler local and integration testing. | Requires contract, integration, and environment testing. |
+| Operations | Fewer moving parts. | Requires strong DevOps, observability, and automation. |
+
+My rule of thumb: start with a modular monolith unless the business and organization already have clear service boundaries and enough operational maturity.
+
+## Benefits
+
+Microservices can help when the system is large enough to justify the overhead.
+
+Benefits:
+
+- **Agility**: teams can work on separate services without coordinating every release.
+- **Independent scaling**: a high-traffic service can scale without scaling the entire system.
+- **Fault isolation**: failure in one service can be contained if boundaries and fallbacks are designed well.
+- **Technology flexibility**: teams can choose the right storage or runtime for a service, within governance limits.
+- **Data isolation**: each service can protect its own schema and persistence model.
+
+These benefits only appear when teams respect service boundaries. A distributed monolith has the cost of microservices without the independence.
+
+## Costs and Challenges
+
+Microservices trade local complexity for distributed complexity.
+
+Common challenges:
+
+- network latency between services
+- partial failures and timeouts
+- harder debugging across request chains
+- duplicated infrastructure concerns
+- data consistency across service boundaries
+- versioning of APIs and event contracts
+- more complex CI/CD and deployment
+- more logs, metrics, traces, and alerts to manage
+- governance problems when every team chooses unrelated tools
+
+Microservices require platform maturity. Without automated deployments, service discovery, centralized logging, metrics, tracing, security standards, and ownership discipline, the architecture becomes fragile.
+
+## When Not to Use Microservices
+
+Microservices are often the wrong choice when:
+
+- the domain boundaries are not clear yet
+- the team is small and release coordination is easy
+- the system has strict low-latency requirements
+- most operations need strong cross-domain transactions
+- the team lacks CI/CD, monitoring, tracing, and incident response maturity
+- the main problem is code organization, not independent scaling or deployment
+
+If a team cannot operate one service reliably, splitting it into ten services rarely makes the system easier.
+
+## Service Decomposition
+
+A service boundary should come from the business domain, not from technical layers.
+
+Bad decomposition:
+
+```text
+UserControllerService
+UserBusinessLogicService
+UserDatabaseService
+```
+
+This splits by technical layer and creates chatty, tightly coupled services.
+
+Better decomposition for e-commerce:
+
+- User Management
+- Order Management
+- Payment
+- Inventory
+- Shipping
+- Notification
+
+Each service owns a business capability and the data needed to protect that capability.
+
+## Domain-Driven Design and Bounded Contexts
+
+Domain-Driven Design helps identify service boundaries through bounded contexts.
+
+A bounded context is a boundary where a domain model has a specific meaning. The same word can mean different things in different contexts.
+
+Example:
+
+- In the **Order** context, "reserved inventory" may mean stock promised to an order.
+- In the **Inventory** context, "available inventory" may mean stock that can still be allocated.
+- In the **Payment** context, "authorized" may mean money has been held but not captured.
+
+Good microservice design avoids forcing one global model onto every team. Each service owns the model that makes sense inside its boundary.
+
+## Database Per Service
+
+A core microservice principle is that each service owns its data. Other services should not read or write its database directly.
+
+Why this matters:
+
+- direct database access couples services to private schemas
+- schema changes become cross-team breaking changes
+- ownership becomes unclear
+- business rules can be bypassed
+
+Instead, services expose data through APIs or events.
+
+```text
+Order Service -> calls Inventory API
+Inventory Service -> owns inventory database
+```
+
+This adds communication overhead, but it preserves boundaries. If multiple services share one database and update each other's tables, the system is not truly independently deployable.
+
+## Communication Styles
+
+Microservices communicate synchronously or asynchronously.
+
+Synchronous communication:
+
+- REST
+- gRPC
+- GraphQL
+
+Asynchronous communication:
+
+- Kafka
+- RabbitMQ
+- AWS SQS
+- event buses and message queues
+
+The choice depends on latency, coupling, consistency, and failure tolerance.
+
+## REST, gRPC, and GraphQL
+
+| Style | Strengths | Tradeoffs | Best Fit |
+| --- | --- | --- | --- |
+| REST | Simple, human-readable, widely supported. | Can over-fetch or under-fetch; weaker typing unless OpenAPI is used. | Public APIs, CRUD resources, broad compatibility. |
+| gRPC | Fast binary protocol, strong contracts, streaming support. | Less browser-native; needs `.proto` tooling. | Internal service-to-service communication. |
+| GraphQL | Client controls response shape, reduces over-fetching. | Requires careful schema governance and query cost control. | Frontend-facing APIs with diverse clients. |
+
+REST is often the easiest default. gRPC is strong for internal low-latency service calls. GraphQL is useful when clients need flexible data selection.
+
+## Synchronous Calls and Timeouts
+
+Synchronous calls are simple to reason about, but they create runtime coupling. If Service A calls Service B, then A's latency and availability now depend on B.
+
+Every network call should have:
+
+- a timeout
+- a retry policy for safe transient failures
+- a circuit breaker for repeated failures
+- observability around latency and error rate
+- an idempotency strategy if retries can repeat writes
+
+Example with a clear timeout:
+
+```java
+@Bean
+RestClient inventoryRestClient(RestClient.Builder builder) {
+    return builder
+        .baseUrl("http://inventory-service")
+        .requestFactory(new JdkClientHttpRequestFactory(
+            HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(2))
+                .build()
+        ))
+        .build();
+}
+```
+
+Timeouts are not optional. A missing timeout can turn one slow dependency into thread exhaustion across the caller.
+
+## Asynchronous Messaging
+
+Asynchronous messaging decouples producers from consumers. A producer publishes an event, and consumers process it later.
+
+Example:
+
+```text
+Order Service publishes OrderPlaced
+Inventory Service reserves stock
+Payment Service authorizes payment
+Notification Service sends email
+```
+
+Benefits:
+
+- producers do not wait for every downstream service
+- consumers can scale independently
+- events can be replayed or recovered
+- temporary consumer outages do not necessarily block the producer
+
+Tradeoffs:
+
+- eventual consistency
+- duplicate messages
+- message ordering concerns
+- harder debugging
+- need for DLQs, retries, and idempotency
+
+## Stateful vs Stateless Services
+
+A stateless service does not rely on server-side session state between requests. Each request carries enough information to be processed independently.
+
+REST APIs are designed to be stateless. This makes horizontal scaling easier because any instance can handle the next request.
+
+A stateful component keeps context across interactions. Examples include WebSocket connections, database sessions, and message brokers.
+
+For microservice APIs, statelessness is usually preferred. State should live in durable stores, caches, or purpose-built stateful infrastructure, not in random application memory.
+
+## Service Discovery
+
+In a dynamic environment, service instances come and go. IP addresses and ports change. Service discovery helps services find healthy instances of other services.
+
+Service discovery usually needs:
+
+- service registration
+- health checks or heartbeats
+- a service catalog
+- load balancing
+
+Client-side discovery:
+
+```text
+Order Service -> queries registry -> chooses Payment instance -> sends request
+```
+
+Server-side discovery:
+
+```text
+Order Service -> calls payment-service DNS name -> platform/load balancer routes to a healthy pod
+```
+
+Netflix Eureka is a common client-side example. Kubernetes Services are a common server-side/platform-level example.
+
+## API Gateway
+
+An API gateway is a centralized entry point for clients. It acts as a reverse proxy and routes requests to internal services.
+
+Common responsibilities:
+
+- request routing
+- authentication and authorization enforcement
+- TLS termination
+- rate limiting
+- request/response transformation
+- aggregation across services
+- centralized logging and metrics
+
+The gateway should not become a large business-logic layer. If too much domain logic moves into the gateway, it becomes another monolith.
+
+## Gateway Patterns
+
+Gateway routing:
+
+```text
+Client -> API Gateway -> User Service
+Client -> API Gateway -> Order Service
+```
+
+Gateway aggregation:
+
+```text
+Client -> API Gateway
+         -> Order Service
+         -> Payment Service
+         -> Shipping Service
+Gateway -> combined response
+```
+
+Gateway offloading:
+
+- rate limiting
+- authentication
+- TLS termination
+- common request logging
+
+These patterns reduce client complexity, but they must be used carefully. Aggregation can hide expensive fan-out calls and increase latency if not monitored.
+
+## Authentication and Authorization
+
+Authentication answers: "Who are you?"
+
+Authorization answers: "What are you allowed to do?"
+
+Authentication must happen before authorization.
+
+In modern microservice systems, clients often authenticate through an authorization server and receive a token. Internal services validate the token or receive verified identity context from a trusted gateway.
+
+## OAuth2, OIDC, and JWT
+
+OAuth2 is an authorization framework. It lets an application access resources on behalf of a user without handling the user's password directly.
+
+OpenID Connect extends OAuth2 for authentication. If the system needs login identity, OIDC is the relevant layer.
+
+JWT is a compact token format with three parts:
+
+```text
+header.payload.signature
+```
+
+JWTs are signed, not encrypted by default. Anyone who has the token can read the claims unless encryption is used. Sensitive data should not be stored in normal JWT payloads.
+
+Good JWT practices:
+
+- use HTTPS
+- validate signature, issuer, audience, and expiration
+- keep token lifetime short
+- avoid storing secrets or sensitive PII in token claims
+- use key rotation
+
+## Service-to-Service Security
+
+External client security is not enough. Internal service calls also need protection.
+
+Common approaches:
+
+- mTLS between services
+- JWT propagation with strict validation
+- service mesh identity
+- network policies
+- least-privilege service accounts
+
+mTLS means both client and server present certificates. It gives each side cryptographic proof of the other's identity.
+
+## Cross-Cutting Concerns
+
+Cross-cutting concerns affect many services but are not core business logic.
+
+Examples:
+
+- logging
+- metrics
+- tracing
+- authentication
+- authorization
+- rate limiting
+- error handling
+- configuration
+- retries and timeouts
+
+Some concerns belong in shared libraries or platform infrastructure. Others belong in each service but should follow common standards. The goal is consistency without hiding too much behavior.
+
+## Resilience Patterns
+
+Distributed systems fail partially. Resilience patterns limit blast radius.
+
+### Timeout
+
+Stop waiting after a known limit.
+
+### Retry
+
+Retry transient failures, ideally with exponential backoff and jitter.
+
+Do not retry every error. Retrying invalid input or permanent failures only creates load.
+
+### Circuit Breaker
+
+Stop calling a failing dependency for a short period. Fail fast instead of letting threads pile up.
+
+```java
+public InventoryView getInventory(String skuId) {
+    try {
+        return inventoryClient.fetch(skuId);
+    } catch (DependencyUnavailableException ex) {
+        return InventoryView.unknown(skuId);
+    }
+}
+```
+
+In production, a library such as Resilience4j can manage circuit state, thresholds, and fallback logic.
+
+### Bulkhead
+
+Separate resources so one dependency cannot consume all threads or connections.
+
+Example: use separate thread pools for payment calls and notification calls.
+
+### Rate Limiting
+
+Protect services from overload by limiting request volume.
+
+## Data Consistency
+
+Microservices make data consistency harder because each service owns its own database.
+
+Avoid distributed transactions when possible. They add coordination cost and reduce availability.
+
+Common alternatives:
+
+- eventual consistency through events
+- Saga pattern
+- transactional outbox
+- idempotent consumers
+- compensating actions
+
+## Saga Pattern
+
+A saga coordinates a business workflow across services through a sequence of local transactions.
+
+Example order flow:
+
+```text
+Create order
+Reserve inventory
+Authorize payment
+Schedule shipment
+```
+
+If payment authorization fails, the system runs compensating actions:
+
+```text
+Release inventory
+Cancel order
+```
+
+Sagas can be choreographed through events or orchestrated by a central workflow coordinator.
+
+## Transactional Outbox
+
+The transactional outbox pattern solves the "database write plus message publish" problem.
+
+Instead of writing the database and publishing an event as two unrelated operations, the service writes both business data and an outbox event in the same database transaction.
+
+```text
+transaction:
+  update order status
+  insert OrderPlaced event into outbox table
+
+relay:
+  read unpublished outbox events
+  publish to Kafka
+  mark as published
+```
+
+This gives reliable event publishing without requiring a distributed transaction between the database and message broker.
+
+## Idempotency
+
+Retries and duplicate messages are normal in distributed systems. Operations should be idempotent when possible.
+
+An idempotent operation can be repeated without changing the final result after the first successful execution.
+
+Common techniques:
+
+- idempotency keys for HTTP writes
+- unique event IDs for message consumers
+- version checks for state updates
+- database unique constraints
+- deduplication tables or Redis keys with TTL
+
+```java
+@Transactional
+public void handle(OrderPlaced event) {
+    if (processedEventRepository.existsById(event.eventId())) {
+        return;
+    }
+
+    inventoryService.reserve(event.orderId(), event.items());
+    processedEventRepository.save(new ProcessedEvent(event.eventId()));
+}
+```
+
+Idempotency is one of the most important practical tools in microservices.
+
+## Observability
+
+Microservices need strong observability because one user action may cross many services.
+
+The three core signals:
+
+- logs
+- metrics
+- traces
+
+Logs explain what happened. Metrics show system health over time. Traces show request flow across services.
+
+Useful metrics:
+
+- request rate
+- error rate
+- P50/P95/P99 latency
+- dependency latency
+- queue depth
+- consumer lag
+- CPU, memory, GC
+- circuit breaker state
+
+## Correlation IDs and Tracing
+
+Every request should have a correlation ID or trace ID. The ID should flow through service calls and logs.
+
+```java
+@Component
+public class CorrelationIdFilter extends OncePerRequestFilter {
+    @Override
+    protected void doFilterInternal(
+        HttpServletRequest request,
+        HttpServletResponse response,
+        FilterChain chain
+    ) throws ServletException, IOException {
+        String correlationId = Optional
+            .ofNullable(request.getHeader("X-Correlation-Id"))
+            .orElse(UUID.randomUUID().toString());
+
+        MDC.put("correlationId", correlationId);
+        response.setHeader("X-Correlation-Id", correlationId);
+        try {
+            chain.doFilter(request, response);
+        } finally {
+            MDC.remove("correlationId");
+        }
+    }
+}
+```
+
+In a real production setup, OpenTelemetry is a common standard for distributed tracing.
+
+## Monitoring Tools
+
+Prometheus collects metrics, usually by scraping application endpoints. Grafana visualizes metrics and dashboards.
+
+Datadog provides managed metrics, logs, traces, events, dashboards, and APM in one platform.
+
+CloudWatch is common in AWS environments for logs, metrics, alarms, and infrastructure visibility.
+
+The tool matters less than the discipline: every service should expose useful health, latency, error, and dependency metrics.
+
+## Logging
+
+Structured logs are easier to search and correlate than plain strings.
+
+Good log fields:
+
+- timestamp
+- service name
+- environment
+- trace ID / correlation ID
+- user or tenant ID when safe
+- endpoint or operation
+- status
+- latency
+- error code
+
+Avoid logging secrets, passwords, raw tokens, or sensitive personal data.
+
+## Testing Strategy
+
+Microservices need several levels of tests.
+
+| Test Type | Purpose |
+| --- | --- |
+| Unit tests | Fast tests for isolated classes and functions. |
+| Component tests | Test one service with mocked or containerized dependencies. |
+| Contract tests | Verify API or event compatibility between services. |
+| Integration tests | Test real interactions with databases, queues, or other services. |
+| End-to-end tests | Test critical user flows across the system. |
+| Load tests | Validate throughput, latency, and resource behavior. |
+
+E2E tests are valuable but expensive. They should focus on critical paths, not every edge case.
+
+## Contract Testing
+
+Contract tests are especially important in microservices because services evolve independently.
+
+Producer and consumer teams need confidence that changes do not break API or event expectations.
+
+Example contract concern:
+
+```json
+{
+  "orderId": "o-123",
+  "status": "PLACED",
+  "items": [
+    { "skuId": "sku-1", "quantity": 2 }
+  ]
+}
+```
+
+Safe changes:
+
+- adding optional fields
+- adding fields with defaults
+
+Breaking changes:
+
+- removing required fields
+- renaming fields
+- changing field type
+- changing semantics without versioning
+
+## CI/CD and Deployment
+
+Microservices need reliable automation.
+
+A typical pipeline:
+
+1. Run unit tests.
+2. Run static checks.
+3. Run component or integration tests.
+4. Build a container image.
+5. Push the image to a registry.
+6. Deploy through rolling update or canary.
+7. Monitor health and rollback if needed.
+
+Kubernetes is commonly used to run containerized services. It handles scheduling, restarts, service discovery, scaling, and rolling deployments.
+
+## Health Checks
+
+A service should expose health endpoints.
+
+In Spring Boot, Actuator is commonly used:
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+```
+
+Kubernetes can use liveness and readiness probes:
+
+- liveness: should this container be restarted?
+- readiness: should this instance receive traffic?
+
+Readiness should check whether the service can actually serve requests, including critical dependencies when appropriate.
+
+## Governance
+
+Microservices need just enough governance.
+
+Useful standards:
+
+- API versioning rules
+- logging format
+- tracing headers
+- authentication and authorization model
+- deployment templates
+- error response format
+- dependency and runtime support policy
+- security baseline
+
+Too little governance creates chaos. Too much governance slows teams down. The goal is shared guardrails, not centralized control of every decision.
+
+## Practical Design Checklist
+
+Before extracting a microservice, I would ask:
+
+- What business capability does this service own?
+- Who owns it operationally?
+- What data does it own?
+- Which APIs or events does it expose?
+- What consistency guarantees are required?
+- What happens if this service is down?
+- What retries are safe?
+- How are duplicate requests or messages handled?
+- How will we observe it in production?
+- How will consumers know if we change the contract?
+
+If those questions do not have clear answers, the service boundary is probably not ready.
+
+## Image References
+
+The following reference images were extracted from the source PDF and saved into the site's image assets.
+
+![Monolith vs microservices architecture](/images/microservices/monolith-vs-microservices.png)
+
+![Production microservice components](/images/microservices/production-microservice-components.png)
+
+![Service discovery flow](/images/microservices/service-discovery.png)
+
