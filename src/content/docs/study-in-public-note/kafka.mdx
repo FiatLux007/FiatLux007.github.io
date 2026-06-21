@@ -1,7 +1,643 @@
 ---
 title: Kafka
-description: Streaming fundamentals with Apache Kafka.
+description: Study notes on Apache Kafka fundamentals, Spring Kafka publishing, partitions, offsets, delivery guarantees, retries, DLQs, and event-driven reliability.
 template: doc
 ---
 
-Topics to come: producers/consumers, partitions, delivery semantics, and operational tips.
+These are my study-in-public notes for Kafka. I use this page to connect Kafka fundamentals with the way I would build a reliable event-driven backend: publish state changes after persistence, preserve per-key ordering, handle retries carefully, and make consumers idempotent.
+
+## Why Kafka
+
+Kafka is a distributed event streaming platform. In backend systems, it is commonly used to decouple services through durable, ordered event logs.
+
+In an inventory system, the write path may need to update the source of truth and notify downstream systems. Kafka helps here because the inventory service can publish an `InventoryUpdated` event, and downstream services can react asynchronously without making the original HTTP request wait for every consumer.
+
+The important design question is not just "How do I send a message?" It is:
+
+- What is the source of truth?
+- What ordering does the business need?
+- What happens when publishing fails?
+- What happens when a consumer processes the same event twice?
+- How do we detect lag, stuck events, and data loss risk?
+
+## Core Concepts
+
+| Concept | Meaning |
+| --- | --- |
+| Broker | A Kafka server node. |
+| Cluster | A group of brokers working together. |
+| Topic | A named stream/category of records. |
+| Partition | An ordered, append-only log inside a topic. |
+| Offset | A record's position inside a partition. |
+| Replica | A copy of a partition stored on another broker for fault tolerance. |
+| Leader | The broker that handles reads and writes for a partition. |
+| ISR | In-sync replicas that are caught up enough to be eligible for safe acknowledgment and leadership. |
+| Consumer group | A group of consumers that share work for a topic. |
+
+Kafka stores messages in topic partitions. A topic can have many partitions, which gives Kafka parallelism. Ordering is guaranteed only within a single partition, not across the whole topic.
+
+## Bootstrap Servers
+
+Bootstrap servers are the initial brokers a Kafka client contacts to discover the cluster.
+
+The client does not need every broker listed. After connecting to one bootstrap broker, it fetches cluster metadata and then talks directly to the broker leaders responsible for the partitions it needs.
+
+```yaml
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+```
+
+## Topics, Partitions, and Ordering
+
+A partition is Kafka's ordering boundary. Messages inside one partition are appended in order and consumed in order by a consumer within a consumer group.
+
+For inventory events, I would use SKU as the message key:
+
+```text
+key = skuId
+value = InventoryUpdatedEvent
+```
+
+This ensures all events for the same SKU are routed to the same partition, preserving per-SKU ordering while still allowing different SKUs to be processed in parallel.
+
+```java
+kafkaTemplate.send("inventory-events", event.skuId(), event);
+```
+
+If the key is null, Kafka may distribute records across partitions for load balancing. That improves distribution, but it does not preserve ordering for a business key.
+
+## Key-Based Partitioning
+
+Kafka uses the record key to choose a partition. Conceptually, this is similar to:
+
+```text
+partition = hash(key) % numberOfPartitions
+```
+
+The practical takeaway:
+
+- Same key usually goes to the same partition.
+- Same partition means per-key ordering is preserved.
+- Different keys can be processed in parallel.
+- Changing the number of partitions can remap keys, so partition count should be planned carefully when ordering matters.
+
+For an inventory system, SKU-based partitioning avoids applying updates for the same SKU out of order.
+
+## Replication and Acknowledgments
+
+Replication protects Kafka from broker failure. Each partition has a leader and follower replicas. Producers write to the leader. Followers replicate the leader's log.
+
+Producer acknowledgments control when a send is considered successful.
+
+| Setting | Meaning | Tradeoff |
+| --- | --- | --- |
+| `acks=0` | Producer does not wait for acknowledgment. | Fast but unsafe. |
+| `acks=1` | Leader acknowledges after writing. | Can lose data if leader fails before followers replicate. |
+| `acks=all` | Leader waits for in-sync replicas based on broker settings. | Safer but higher latency. |
+
+For important events, I prefer `acks=all` with idempotence enabled.
+
+```yaml
+spring:
+  kafka:
+    producer:
+      acks: all
+      properties:
+        enable.idempotence: true
+      retries: 3
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+```
+
+On the broker side, durability also depends on settings such as replication factor and `min.insync.replicas`. Producer settings alone cannot protect data if the topic is under-replicated.
+
+## Offsets
+
+An offset is a message position inside a partition.
+
+Consumer progress is tracked per partition and per consumer group. If a consumer group has processed records up to offset 100 in partition 0, Kafka knows where that group should resume.
+
+Important detail: the committed offset usually represents the next record the consumer should read, not the last record it processed.
+
+```text
+poll record at offset 42
+process record
+commit offset 43
+```
+
+If the consumer crashes before committing, Kafka can deliver the same message again after rebalance. That is the basis of at-least-once processing.
+
+## Consumer Groups
+
+A consumer group lets multiple consumer instances share work.
+
+Rules:
+
+- One partition can be assigned to only one consumer within the same consumer group at a time.
+- One consumer can process multiple partitions.
+- The same partition can be consumed by multiple different consumer groups independently.
+- Effective parallelism for one topic and one consumer group is limited by partition count.
+
+If a topic has 6 partitions and a consumer group has 3 consumers, each consumer may get about 2 partitions. If the group has 10 consumers, 4 consumers will be idle because only 6 partitions exist.
+
+## Pull-Based Model
+
+Kafka consumers pull messages from brokers. This gives consumers control over their own pace and allows natural backpressure.
+
+If processing is slow, the consumer can poll fewer records or process batches more carefully. If consumption is consistently slower than production, consumer lag grows.
+
+## Spring Kafka Publisher Layer
+
+In a Spring Boot service, `KafkaTemplate` is Spring's abstraction over the Kafka producer API. It handles serialization, producer configuration, retries, and result callbacks while integrating with dependency injection.
+
+In my inventory flow, the publisher is separate from command handling and persistence:
+
+1. The request handler receives an inventory update.
+2. The command handler validates business rules and computes the new state.
+3. The event handler persists the updated state to Cassandra.
+4. The publisher maps the domain event to a Kafka message and sends it downstream.
+
+```java
+@Service
+public class InventoryEventPublisher {
+    private final KafkaTemplate<String, InventoryUpdatedEvent> kafkaTemplate;
+
+    public InventoryEventPublisher(KafkaTemplate<String, InventoryUpdatedEvent> kafkaTemplate) {
+        this.kafkaTemplate = kafkaTemplate;
+    }
+
+    public CompletableFuture<SendResult<String, InventoryUpdatedEvent>> publish(InventoryUpdatedEvent event) {
+        return kafkaTemplate.send("inventory-events", event.skuId(), event);
+    }
+}
+```
+
+The send is asynchronous. The request thread submits the send and registers callbacks instead of blocking for a Kafka acknowledgment.
+
+## Non-Blocking Publishing with CompletableFuture
+
+`Future.get()` blocks. `CompletableFuture` lets me attach success and failure callbacks without blocking the request thread.
+
+```java
+publisher.publish(event)
+    .thenAccept(result -> {
+        long offset = result.getRecordMetadata().offset();
+        log.info("published inventory event eventId={} sku={} offset={}",
+            event.eventId(), event.skuId(), offset);
+    })
+    .exceptionally(ex -> {
+        log.error("failed to publish inventory event eventId={} sku={}",
+            event.eventId(), event.skuId(), ex);
+        deadLetterPublisher.publish(event, ex);
+        return null;
+    });
+```
+
+I would use non-blocking behavior at the event publishing layer because Kafka publishing is I/O-heavy and downstream consumers are asynchronous. I would not make the core command handling or persistence path fire-and-forget, because those steps are part of the consistency boundary.
+
+## `KafkaTemplate.flush()`
+
+`KafkaTemplate.flush()` forces buffered records to be sent immediately.
+
+It is not something I would call after every send, because that defeats batching and hurts throughput. It is more useful during shutdown or controlled draining, where the application wants to reduce the chance of losing buffered sends.
+
+```java
+@PreDestroy
+void shutdown() {
+    kafkaTemplate.flush();
+}
+```
+
+## Serialization
+
+Kafka does not send Java objects directly. A record value must be serialized into bytes.
+
+```text
+InventoryUpdatedEvent
+    -> JSON / Avro / Protobuf serializer
+    -> byte[]
+    -> Kafka broker
+```
+
+JSON is simple and readable, but schema compatibility can be harder to enforce. Avro or Protobuf are stronger choices when schema evolution matters.
+
+If serialization fails, retrying usually does not help. Bad payloads should fail fast and be routed to an error path with enough metadata to debug the issue.
+
+## Delivery Semantics
+
+Kafka systems are often described with three delivery levels.
+
+| Semantics | Meaning |
+| --- | --- |
+| At-most-once | A message may be lost, but it is not processed twice. |
+| At-least-once | A message is not silently lost, but it may be processed more than once. |
+| Exactly-once | Processing appears exactly once within a defined transactional boundary. |
+
+Most practical service integrations use at-least-once delivery plus idempotent consumers.
+
+Exactly-once semantics in Kafka are real but scoped. They are most useful when consuming from Kafka, processing, and producing back to Kafka transactionally. They do not magically make a database write and Kafka publish atomic unless the full architecture is designed around that boundary.
+
+## The Dual-Write Problem
+
+The dual-write problem appears when one service needs to update a database and publish an event.
+
+```text
+write database
+publish Kafka event
+```
+
+These two operations are not automatically atomic. If the app crashes after the database write but before the Kafka publish, the state changes but downstream systems never hear about it. If the event is published before the database commit, consumers may react to a state change that never becomes durable.
+
+This is the core reliability problem behind event-driven services.
+
+## Outbox Pattern
+
+The classic Outbox Pattern solves the dual-write problem by writing business data and an event record into the same database transaction.
+
+```text
+database transaction:
+  update inventory state
+  insert outbox event
+
+background relay:
+  read outbox event
+  publish to Kafka
+  mark event as published
+```
+
+The database becomes the durable anchor. A relay worker can retry publishing until the event reaches Kafka.
+
+The tradeoff is extra infrastructure and possible delay, because publication depends on the relay cycle.
+
+## Async-After-Commit with a Sweeper
+
+The project notes describe a pattern close to Outbox, optimized for low latency.
+
+Flow:
+
+1. Persist the inventory update.
+2. Persist a pending-event record in the same durable write path.
+3. After persistence succeeds, publish to Kafka asynchronously.
+4. On Kafka acknowledgment, delete or mark the pending event as published.
+5. A background sweeper scans old pending events and republishes them.
+
+```text
+HTTP request
+  -> validate command
+  -> write inventory state + pending event
+  -> async publish to Kafka
+  -> return response after durable write
+
+sweeper job
+  -> find pending events older than threshold
+  -> republish to Kafka
+  -> mark published on success
+```
+
+This gives the request path low latency while keeping a safety net for app crashes or async callback failures.
+
+Because the sweeper may republish the same event, consumers must be idempotent.
+
+## Producer Failure Scenarios
+
+| Failure | Example | Strategy |
+| --- | --- | --- |
+| Transient network failure | Ack lost or timeout. | Retry with idempotent producer enabled. |
+| Broker leader failure | Leader dies during write. | Use replication, `acks=all`, and proper `min.insync.replicas`. |
+| Producer crash | App dies after durable DB write but before Kafka ack. | Use pending-event/outbox record and sweeper. |
+| Serialization error | Event cannot be converted to bytes. | Fail fast, log, route to DLQ/error table. |
+| Message too large | Payload exceeds producer or broker limit. | Reduce payload, compress, or tune limits carefully. |
+
+Producer idempotence helps prevent duplicate records caused by retries. Kafka uses producer IDs and sequence numbers per partition to identify duplicate sends.
+
+## Consumer Failure Scenarios
+
+Consumers should commit offsets only after successful processing if the system wants at-least-once behavior.
+
+```text
+poll message
+process message
+commit offset
+```
+
+If the consumer crashes before commit, the message is reprocessed after rebalance. If the consumer commits before processing and then crashes, the message can be lost from that consumer group's perspective.
+
+That is why I prefer manual offset control for critical consumers.
+
+```yaml
+spring:
+  kafka:
+    consumer:
+      enable-auto-commit: false
+    listener:
+      ack-mode: manual
+```
+
+```java
+@KafkaListener(topics = "inventory-events", groupId = "inventory-read-model")
+public void consume(
+    InventoryUpdatedEvent event,
+    Acknowledgment ack
+) {
+    processIdempotently(event);
+    ack.acknowledge();
+}
+```
+
+## Idempotent Consumers
+
+At-least-once delivery means duplicates are possible. Idempotency makes duplicate processing safe.
+
+Common techniques:
+
+- Store processed event IDs in a database table with a unique constraint.
+- Use SKU-based version checks and ignore older versions.
+- Make writes naturally idempotent by setting final state instead of applying deltas.
+- Use Redis with TTL for short-lived deduplication when long-term history is not required.
+
+Example with a processed event table:
+
+```java
+@Transactional
+public void processIdempotently(InventoryUpdatedEvent event) {
+    if (processedEventRepository.existsById(event.eventId())) {
+        return;
+    }
+
+    readModelRepository.apply(event);
+    processedEventRepository.save(new ProcessedEvent(event.eventId()));
+}
+```
+
+For inventory, version-based checks are often more meaningful than blind deduplication:
+
+```java
+if (event.version() <= currentView.version()) {
+    return;
+}
+
+currentView.apply(event);
+```
+
+## Dead-Letter Topics
+
+A dead-letter topic stores events that could not be processed successfully after the normal retry path.
+
+Good DLQ records include:
+
+- original topic
+- original partition and offset
+- event key
+- original payload
+- error type and message
+- timestamp
+- consumer group or producer name
+
+DLQs should not become a place where events disappear. They need monitoring, ownership, and a replay process.
+
+For non-recoverable consumer errors, such as invalid schema or impossible business data, route the message to a DLQ and commit the original offset. Otherwise one poison message can block the whole partition.
+
+## Retry Strategy
+
+Retries should match the failure type.
+
+Transient failures:
+
+- network timeout
+- temporary database outage
+- downstream service unavailable
+
+These can be retried with backoff.
+
+Non-recoverable failures:
+
+- serialization error
+- invalid schema
+- missing required field
+- message too large
+
+These should fail fast and move to an error path.
+
+In Spring Kafka, a common consumer strategy is retry with backoff, then recover to a dead-letter topic.
+
+```java
+@Bean
+DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<String, Object> template) {
+    DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(template);
+    FixedBackOff backOff = new FixedBackOff(1_000L, 3L);
+    return new DefaultErrorHandler(recoverer, backOff);
+}
+```
+
+## Consumer Lag
+
+Consumer lag is the difference between the latest available offset and the consumer group's committed offset.
+
+High lag means consumers are falling behind.
+
+Common causes:
+
+- business logic is slow
+- database or downstream calls are slow
+- too few partitions
+- too few consumer instances
+- batch size too large
+- frequent GC pauses
+- consumer group rebalances
+
+Common responses:
+
+- optimize processing logic
+- increase partitions and consumer instances together
+- tune `max.poll.records`
+- move slow I/O to controlled worker pools
+- monitor database latency and downstream dependencies
+
+Adding consumers only helps until consumer count reaches partition count.
+
+## Rebalances
+
+A rebalance happens when Kafka changes partition assignments across consumers in a group.
+
+Rebalances are normal during deploys or scaling, but frequent rebalances can stop useful work.
+
+Common causes:
+
+- consumer processing takes longer than `max.poll.interval.ms`
+- heartbeats fail because of network or long pauses
+- consumers are constantly joining/leaving the group
+- batch size is too large for the processing time
+
+Useful mitigations:
+
+- reduce `max.poll.records`
+- increase `max.poll.interval.ms` when processing legitimately takes longer
+- keep processing time predictable
+- use static membership when appropriate
+- monitor rebalance frequency
+
+## Monitoring and Debugging
+
+Kafka reliability depends on monitoring both the application and the Kafka cluster.
+
+Producer indicators:
+
+- send failure rate
+- retry rate
+- record error rate
+- producer latency
+- batch size and compression ratio
+- DLQ publish count
+
+Broker/topic indicators:
+
+- under-replicated partitions
+- offline partitions
+- ISR shrink/expand rate
+- disk usage
+- broker request latency
+
+Consumer indicators:
+
+- consumer lag
+- processing latency
+- commit failures
+- rebalance count
+- DLQ count
+- duplicate-detection count
+
+Application logs should include event IDs, keys, topic, partition, and offset. That makes it possible to trace one inventory update from HTTP request to Kafka publish to downstream consumption.
+
+```java
+log.info("published eventId={} sku={} topic={} partition={} offset={}",
+    event.eventId(),
+    event.skuId(),
+    metadata.topic(),
+    metadata.partition(),
+    metadata.offset());
+```
+
+## How to Investigate Possible Lost Events
+
+I would check the pipeline by boundary.
+
+Producer side:
+
+- Did the application persist the inventory state?
+- Was a pending-event/outbox record created?
+- Did `KafkaTemplate` callback report success or failure?
+- Did producer retries happen?
+- Are there records in the producer DLQ?
+
+Kafka cluster:
+
+- Is the topic healthy?
+- Are partitions under-replicated?
+- Did brokers restart?
+- Are there ISR issues?
+- Is retention deleting events earlier than expected?
+
+Consumer side:
+
+- What is the committed offset for the consumer group?
+- Is consumer lag growing?
+- Did the consumer route records to DLQ?
+- Did the consumer crash before or after committing offset?
+- Are duplicate/idempotency checks rejecting events?
+
+The most useful debugging data is a stable `eventId` carried from the database record into the Kafka message and logs.
+
+## Schema Evolution
+
+Kafka topics often live longer than any single service version. Event schemas must evolve carefully.
+
+Safer changes:
+
+- add optional fields
+- add fields with defaults
+- keep old field names stable
+
+Risky changes:
+
+- remove required fields
+- rename fields
+- change field type
+- change semantic meaning without changing schema
+
+Schema registries, Avro, and Protobuf help enforce compatibility. Even with JSON, I would document event contracts and validate required fields at the edges.
+
+## Spring Boot Example: Producer Configuration
+
+```yaml
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      acks: all
+      retries: 3
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        enable.idempotence: true
+        delivery.timeout.ms: 120000
+        request.timeout.ms: 30000
+        linger.ms: 5
+        compression.type: lz4
+```
+
+`linger.ms` gives the producer a small window to batch records. Compression can reduce network and disk usage, especially for JSON payloads.
+
+## Spring Boot Example: Consumer Configuration
+
+```yaml
+spring:
+  kafka:
+    consumer:
+      group-id: inventory-read-model
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "com.example.inventory"
+        max.poll.records: 100
+        max.poll.interval.ms: 300000
+    listener:
+      ack-mode: manual
+      concurrency: 3
+```
+
+`concurrency` in Spring Kafka can run multiple listener threads in the same process, but it cannot exceed the useful parallelism of the assigned partitions.
+
+## Kafka and CQRS
+
+Kafka often fits CQRS-style designs.
+
+The write service owns the command path and source of truth. After a successful state change, it publishes an event. Read-optimized services consume those events and update their own stores, such as Redis, Elasticsearch, or a relational read model.
+
+```text
+Inventory command service
+  -> Cassandra source of truth
+  -> Kafka inventory-events
+  -> search/read-model/cache services
+```
+
+This separates correctness-heavy writes from high-throughput reads. The tradeoff is eventual consistency: read models may lag behind the source of truth.
+
+## Review Checklist
+
+Questions I should be able to answer clearly:
+
+- Why does Kafka guarantee ordering only within a partition?
+- Why use SKU as the message key for inventory events?
+- What is an offset, and when should a consumer commit it?
+- Why does at-least-once delivery require idempotent consumers?
+- What does `acks=all` protect, and what does it not protect by itself?
+- How does producer idempotence handle duplicate retries?
+- Why is database write plus Kafka publish a dual-write problem?
+- How does the Outbox Pattern solve that problem?
+- What does a sweeper job protect against?
+- When should a message go to a DLQ instead of being retried forever?
+- What metrics would I check if consumer lag spikes?
+- How would I investigate a suspected lost event?
+
