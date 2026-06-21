@@ -1,7 +1,679 @@
 ---
 title: Springboot
-description: Spring Boot patterns and backend building blocks.
+description: Study notes on Spring Boot, REST APIs, dependency injection, persistence, security, testing, and production-ready service design.
 template: doc
 ---
 
-Notes will cover REST services, configuration, persistence, and production-ready patterns.
+These are my study-in-public notes for Spring Boot backend development. I use this page to connect interview concepts with the way a real service is usually structured: controller, service, repository, persistence, validation, security, testing, and runtime configuration.
+
+## Maven Build Lifecycle
+
+Maven builds move through ordered phases. Running a later phase also runs the phases before it.
+
+| Phase | What It Does |
+| --- | --- |
+| `validate` | Checks whether the project has enough metadata and valid structure to build. |
+| `compile` | Compiles production code under `src/main/java`. |
+| `test` | Compiles and runs tests, usually through the Surefire plugin. |
+| `package` | Packages compiled classes and resources into a JAR or WAR. |
+| `verify` | Runs additional checks such as integration tests, coverage rules, or static analysis. |
+| `install` | Installs the artifact into the local Maven repository under `~/.m2/repository`. |
+| `deploy` | Publishes the artifact to a remote repository such as Nexus, Artifactory, or GitHub Packages. |
+
+Dependency downloading is not tied to one single phase. Maven resolves dependencies before the phase that needs them. For example, `mvn test` may download JUnit, Mockito, and `spring-boot-starter-test` because test-scope dependencies are needed for that phase.
+
+In a Spring Boot project, `package` often does more than produce a normal JAR. With `spring-boot-maven-plugin`, Maven can repackage the application into an executable fat JAR that contains the application code and runtime dependencies.
+
+```bash
+mvn clean package
+java -jar target/app.jar
+```
+
+## IoC and Dependency Injection
+
+Inversion of Control means application code does not manually create and wire every dependency. The Spring container takes over object creation, dependency resolution, lifecycle callbacks, and configuration.
+
+Dependency Injection is the concrete technique Spring uses to provide dependencies from the outside.
+
+```java
+@Service
+public class TaskService {
+    private final TaskRepository taskRepository;
+
+    public TaskService(TaskRepository taskRepository) {
+        this.taskRepository = taskRepository;
+    }
+}
+```
+
+Constructor injection is usually preferred because it makes dependencies explicit, supports immutability, improves testability, and fails fast if a required bean is missing.
+
+Setter injection is useful for optional dependencies. Field injection is convenient, but I avoid it in production code because it hides dependencies and makes unit testing harder.
+
+## BeanFactory vs ApplicationContext
+
+`BeanFactory` is the basic Spring container abstraction. It can create and provide beans, and it usually initializes beans lazily.
+
+`ApplicationContext` builds on top of `BeanFactory` and is what Spring Boot applications normally use. It supports annotation-based configuration, event publishing, internationalization, environment properties, resource loading, and integration with other Spring features. In typical Spring Boot applications, singleton beans are eagerly created during startup unless configured otherwise.
+
+## Bean Lifecycle
+
+A Spring bean's lifecycle is managed by the container.
+
+1. Spring creates the bean instance.
+2. Spring injects dependencies through constructors, setters, or fields.
+3. Spring runs lifecycle callbacks, such as `@PostConstruct`.
+4. The bean is ready to serve application logic.
+5. On shutdown, Spring runs cleanup callbacks such as `@PreDestroy`.
+
+`@PostConstruct` is useful for startup logic that depends on injected dependencies. For example, a service can validate that required Kafka topics exist or seed development data in an idempotent way.
+
+```java
+@Service
+public class BootstrapUserService {
+    private final UserRepository userRepository;
+
+    public BootstrapUserService(UserRepository userRepository) {
+        this.userRepository = userRepository;
+    }
+
+    @PostConstruct
+    void seedUsers() {
+        userRepository.findByUsername("admin")
+            .orElseGet(() -> userRepository.save(new User("admin", Role.ADMIN)));
+    }
+}
+```
+
+If startup work talks to external systems, it should be idempotent and fail clearly. Silent startup failures are painful in production.
+
+## Component Stereotypes
+
+`@Component` marks a class as a Spring-managed bean. Several common annotations specialize it:
+
+| Annotation | Typical Role |
+| --- | --- |
+| `@Component` | Generic Spring-managed component. |
+| `@Service` | Business logic layer. |
+| `@Repository` | Persistence/data access layer. |
+| `@Controller` | MVC controller that may return views. |
+| `@RestController` | REST controller that returns response bodies, usually JSON. |
+
+`@Repository` also allows Spring to translate certain persistence exceptions into Spring's data access exception hierarchy.
+
+## `@SpringBootApplication`
+
+`@SpringBootApplication` is a meta-annotation that combines three important annotations:
+
+- `@Configuration`: marks the class as a source of bean definitions.
+- `@EnableAutoConfiguration`: asks Spring Boot to configure beans based on classpath dependencies, properties, and defaults.
+- `@ComponentScan`: scans the current package and subpackages for Spring components.
+
+This is why the main application class is usually placed at the root package of the project.
+
+```java
+@SpringBootApplication
+public class InventoryApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(InventoryApplication.class, args);
+    }
+}
+```
+
+## Auto-Configuration and Starters
+
+Spring Boot starters bundle common dependencies.
+
+Examples:
+
+- `spring-boot-starter-web`: Spring MVC, JSON support, embedded Tomcat.
+- `spring-boot-starter-data-jpa`: Spring Data JPA and Hibernate.
+- `spring-boot-starter-security`: Spring Security.
+- `spring-boot-starter-test`: JUnit, Mockito, AssertJ, and Spring test utilities.
+- `spring-boot-starter-actuator`: health checks, metrics, and operational endpoints.
+
+Auto-configuration is powerful because it removes repetitive setup. The tradeoff is transparency: when behavior is surprising, I need to inspect which auto-configurations applied and which beans exist in the context.
+
+Useful debugging tools:
+
+```properties
+debug=true
+management.endpoints.web.exposure.include=health,info,metrics
+```
+
+## Bean Selection: `@Primary` and `@Qualifier`
+
+When only one bean of a type exists, Spring injects it by type. If multiple beans match, Spring needs more information.
+
+`@Primary` marks a default candidate.
+
+```java
+@Bean
+@Primary
+PaymentClient stripePaymentClient() {
+    return new StripePaymentClient();
+}
+```
+
+`@Qualifier` explicitly selects a bean and has higher precision than relying on `@Primary`.
+
+```java
+public CheckoutService(@Qualifier("paypalPaymentClient") PaymentClient client) {
+    this.client = client;
+}
+```
+
+If Spring cannot resolve ambiguity, application startup fails. That is good: ambiguous dependency wiring should not be discovered at runtime.
+
+## REST APIs
+
+REST APIs model resources and use HTTP methods to express actions.
+
+| HTTP Method | Common Meaning | Idempotent |
+| --- | --- | --- |
+| `GET` | Read a resource or collection. | Yes |
+| `POST` | Create a new resource or submit a command. | No |
+| `PUT` | Replace or update a resource. | Yes |
+| `PATCH` | Partially update a resource. | Usually, but depends on design |
+| `DELETE` | Remove a resource. | Yes |
+
+Good REST URLs use nouns, not action names:
+
+- `GET /api/users`
+- `GET /api/users/123`
+- `POST /api/users`
+- `GET /api/users/123/tasks`
+
+## Request Data: Path, Query, and Body
+
+Spring MVC has three common ways to receive request data.
+
+```java
+@RestController
+@RequestMapping("/api/tasks")
+public class TaskController {
+    private final TaskService taskService;
+
+    public TaskController(TaskService taskService) {
+        this.taskService = taskService;
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<TaskResponse> getTask(@PathVariable Long id) {
+        return ResponseEntity.ok(taskService.getTask(id));
+    }
+
+    @GetMapping
+    public Page<TaskResponse> listTasks(
+        @RequestParam(defaultValue = "0") int page,
+        @RequestParam(defaultValue = "20") int size
+    ) {
+        return taskService.listTasks(page, size);
+    }
+
+    @PostMapping
+    public ResponseEntity<TaskResponse> createTask(@Valid @RequestBody CreateTaskRequest request) {
+        TaskResponse created = taskService.createTask(request);
+        return ResponseEntity.status(HttpStatus.CREATED).body(created);
+    }
+}
+```
+
+Use `@PathVariable` when the value identifies the resource. Use `@RequestParam` for filtering, sorting, pagination, and optional query behavior. Use `@RequestBody` when the client sends a JSON payload, usually for `POST`, `PUT`, or `PATCH`.
+
+## ResponseEntity
+
+Returning an object directly lets Spring serialize the body and usually return `200 OK`.
+
+`ResponseEntity` gives explicit control over the full HTTP response: status code, headers, and body.
+
+Common patterns:
+
+```java
+return ResponseEntity.ok(body);                       // 200
+return ResponseEntity.status(HttpStatus.CREATED).body(body); // 201
+return ResponseEntity.noContent().build();            // 204
+return ResponseEntity.badRequest().body(error);       // 400
+```
+
+For dynamic resources such as task lists, response headers can prevent stale browser behavior:
+
+```java
+return ResponseEntity.ok()
+    .cacheControl(CacheControl.noCache())
+    .body(tasks);
+```
+
+## HTTP Status Codes
+
+Status codes are part of API design.
+
+| Code | Meaning |
+| --- | --- |
+| `200 OK` | Request succeeded. |
+| `201 Created` | A resource was created. |
+| `204 No Content` | Request succeeded with no response body. |
+| `400 Bad Request` | Invalid client input. |
+| `401 Unauthorized` | User is not authenticated. |
+| `403 Forbidden` | User is authenticated but not allowed. |
+| `404 Not Found` | Resource does not exist. |
+| `409 Conflict` | Request conflicts with current state. |
+| `500 Internal Server Error` | Server-side failure. |
+
+## Servlet, Tomcat, and Spring MVC Flow
+
+A servlet is a server-side Java component that handles HTTP requests and responses. Tomcat is a servlet container: it manages servlet lifecycle, networking, and request threads.
+
+In Spring Boot MVC applications, we usually do not write servlets directly. Requests flow through Spring's `DispatcherServlet`.
+
+Request flow:
+
+1. Embedded Tomcat receives the HTTP request.
+2. Tomcat forwards it to `DispatcherServlet`.
+3. `DispatcherServlet` uses `HandlerMapping` to find the controller method.
+4. Spring binds path variables, query parameters, headers, and request body.
+5. The controller calls the service layer.
+6. The service layer runs business logic and uses repositories when persistence is needed.
+7. The return value is serialized to JSON by message converters.
+8. `DispatcherServlet` sends the response back to the client.
+
+A single servlet instance can handle many requests concurrently through multiple threads. That is why shared mutable state in controllers and services must be treated carefully.
+
+## Tomcat vs Docker
+
+Tomcat and Docker solve different problems.
+
+Tomcat runs Java web applications. Docker packages an application with its runtime dependencies into an isolated container image.
+
+In practice, a Spring Boot service often starts an embedded Tomcat inside a Docker container.
+
+## RestTemplate vs WebClient
+
+`RestTemplate` is a synchronous, blocking HTTP client. It is simple and fits traditional Spring MVC code, but each request occupies a thread while waiting for the response.
+
+`WebClient` is a non-blocking HTTP client from Spring WebFlux. It represents asynchronous results with `Mono` and `Flux`.
+
+```java
+User user = restTemplate.getForObject(url, User.class);
+```
+
+```java
+Mono<User> userMono = webClient.get()
+    .uri(url)
+    .retrieve()
+    .bodyToMono(User.class);
+```
+
+For new code, `WebClient` is often preferred when a service needs high concurrency or reactive composition. For a simple blocking MVC service, a well-configured HTTP client bean is still reasonable.
+
+If `RestTemplate` is used frequently, it should be configured as a bean and injected. Creating it inside each try/catch block scatters configuration, hurts testability, and repeats object creation.
+
+## Mono, Flux, and Backpressure
+
+`Mono<T>` represents an asynchronous stream with zero or one value.
+
+`Flux<T>` represents an asynchronous stream with zero to many values.
+
+Backpressure is how downstream consumers signal how much data they can handle. Without it, a fast producer can overwhelm a slow consumer, causing memory growth, thread starvation, or cascading latency.
+
+Reactive programming is not automatically faster. It is useful when the service spends a lot of time waiting on I/O and can benefit from fewer blocked threads.
+
+## DTOs vs Entities
+
+DTO stands for Data Transfer Object. A DTO defines the data shape used at an API boundary or between layers.
+
+An entity represents persistent domain state mapped to a database table. An entity is managed by JPA/Hibernate and has persistence lifecycle behavior.
+
+I prefer keeping DTOs and entities separate:
+
+- DTOs protect API contracts from database schema changes.
+- DTOs prevent exposing internal fields accidentally.
+- DTOs are a natural place for request validation annotations.
+- Entities can focus on persistence and relationships.
+
+```java
+public record CreateTaskRequest(
+    @NotBlank String title,
+    @NotNull Long assigneeId
+) {}
+```
+
+```java
+@Entity
+@Table(name = "tasks")
+public class Task {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false)
+    private String title;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "assignee_id")
+    private User assignee;
+}
+```
+
+## Input Validation
+
+Validation usually happens at multiple layers.
+
+At the API boundary, Bean Validation rejects invalid requests before they reach business logic.
+
+```java
+@PostMapping
+public ResponseEntity<TaskResponse> create(@Valid @RequestBody CreateTaskRequest request) {
+    return ResponseEntity.status(HttpStatus.CREATED).body(taskService.createTask(request));
+}
+```
+
+At the service layer, business rules enforce consistency:
+
+```java
+if (!manager.canAssign(assignee)) {
+    throw new ForbiddenOperationException("manager cannot assign this user");
+}
+```
+
+At the database layer, constraints such as `nullable = false`, unique indexes, and foreign keys act as a final defense.
+
+## Exception Handling
+
+`@ControllerAdvice` centralizes API error handling so controllers do not repeat try/catch blocks.
+
+```java
+@RestControllerAdvice
+public class ApiExceptionHandler {
+    @ExceptionHandler(EntityNotFoundException.class)
+    ResponseEntity<ApiError> handleNotFound(EntityNotFoundException ex) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+            .body(new ApiError("NOT_FOUND", ex.getMessage()));
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    ResponseEntity<ApiError> handleValidation(MethodArgumentNotValidException ex) {
+        return ResponseEntity.badRequest()
+            .body(new ApiError("VALIDATION_ERROR", "request body is invalid"));
+    }
+}
+```
+
+This keeps controllers focused on normal request flow and makes API errors consistent.
+
+## Persistence: ORM, JPA, Hibernate, JDBC
+
+The persistence stack often looks like this:
+
+```text
+Repository / Entity
+    -> Spring Data JPA
+    -> Hibernate
+    -> JDBC API
+    -> MySQL JDBC Driver
+    -> MySQL Database
+```
+
+ORM lets application code work with domain objects instead of writing SQL for every operation.
+
+JPA is the specification that defines entity mapping, persistence context, relationships, and query APIs.
+
+Hibernate is a concrete JPA implementation. It performs the real ORM work: mapping entities to tables, generating SQL, tracking entity state, managing caches, and executing database operations.
+
+JDBC is the lower-level Java API for database communication. A database vendor, such as MySQL, provides a JDBC driver that implements the JDBC interfaces.
+
+## Common JPA Annotations
+
+| Annotation | Purpose |
+| --- | --- |
+| `@Entity` | Marks a class as a JPA-managed entity. |
+| `@Table` | Configures the database table name and related table metadata. |
+| `@Id` | Marks the primary key. |
+| `@GeneratedValue` | Configures primary-key generation strategy. |
+| `@Column` | Configures column name, nullability, length, or uniqueness. |
+| `@Enumerated(EnumType.STRING)` | Stores enum names instead of ordinal numbers. |
+| `@ManyToOne` | Models many rows referencing one parent row. |
+| `@JoinColumn` | Defines the foreign-key column. |
+
+`@ManyToOne` is usually the owning side because it contains the foreign key column. For example, many users can reference one manager through `manager_id`.
+
+## Lombok with Entities
+
+Lombok reduces boilerplate at compile time, but entities need care.
+
+`@Data` generates getters, setters, `toString`, `equals`, and `hashCode`. On JPA entities, this can be risky because relationships may be lazy-loaded or recursive.
+
+For relationship fields, exclusions can prevent infinite recursion:
+
+```java
+@ManyToOne(fetch = FetchType.LAZY)
+@ToString.Exclude
+@EqualsAndHashCode.Exclude
+private User manager;
+```
+
+I prefer being explicit with entities: use `@Getter`, `@Setter`, and carefully defined equality instead of applying `@Data` everywhere.
+
+## Repository Layer
+
+The repository layer abstracts data access so the service layer can focus on business logic.
+
+By extending `JpaRepository`, a repository inherits common methods such as `save`, `findById`, `findAll`, and `delete`.
+
+```java
+public interface TaskRepository extends JpaRepository<Task, Long> {
+    List<Task> findByAssigneeId(Long assigneeId);
+
+    @Query("""
+        select t from Task t
+        where t.creator.id = :userId
+           or t.assignee.id = :userId
+    """)
+    List<Task> findVisibleTasks(@Param("userId") Long userId);
+}
+```
+
+Derived queries are useful for simple field-based lookups. `@Query` is better when the business query is complex enough that method names become unreadable.
+
+## Service Layer and Transactions
+
+The service layer owns business rules and transaction boundaries.
+
+```java
+@Service
+public class TaskService {
+    private final TaskRepository taskRepository;
+    private final UserRepository userRepository;
+
+    public TaskService(TaskRepository taskRepository, UserRepository userRepository) {
+        this.taskRepository = taskRepository;
+        this.userRepository = userRepository;
+    }
+
+    @Transactional
+    public TaskResponse assignTask(Long taskId, Long assigneeId) {
+        Task task = taskRepository.findById(taskId)
+            .orElseThrow(() -> new EntityNotFoundException("task not found"));
+
+        User assignee = userRepository.findById(assigneeId)
+            .orElseThrow(() -> new EntityNotFoundException("user not found"));
+
+        task.assignTo(assignee);
+        return TaskResponse.from(task);
+    }
+}
+```
+
+`@Transactional` makes multiple database operations succeed or fail as one unit. If a runtime exception is thrown, Spring rolls the transaction back by default.
+
+Use `@Transactional(readOnly = true)` for query methods. It documents intent and can allow persistence providers to optimize reads.
+
+## Configuration and Profiles
+
+Spring Boot reads configuration from `application.properties`, `application.yml`, environment variables, command-line arguments, and profile-specific files.
+
+Profiles let the same application run with different settings:
+
+```yaml
+spring:
+  profiles:
+    active: dev
+```
+
+```yaml
+# application-dev.yml
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/app_dev
+```
+
+```yaml
+# application-prod.yml
+spring:
+  datasource:
+    url: ${DATABASE_URL}
+```
+
+Secrets should not be committed into the repository. In production, use environment variables or a secret manager.
+
+## Spring Security and OAuth2 Resource Servers
+
+Spring Security handles authentication and authorization through a filter chain before requests reach the controller.
+
+In modern API services, the application often acts as an OAuth2 Resource Server. The client sends a JWT access token in the `Authorization` header. Spring Security validates the token, extracts identity and authorities, and decides whether the endpoint is allowed.
+
+```java
+@Bean
+SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+    return http
+        .authorizeHttpRequests(auth -> auth
+            .requestMatchers("/actuator/health").permitAll()
+            .requestMatchers(HttpMethod.GET, "/api/tasks/**").authenticated()
+            .requestMatchers("/api/admin/**").hasRole("ADMIN")
+            .anyRequest().authenticated()
+        )
+        .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()))
+        .build();
+}
+```
+
+`SecurityContextHolder` stores the current request's security context. It holds an `Authentication` object with the current user's identity and authorities. In the traditional servlet model, it is backed by `ThreadLocal`, which keeps each request thread's security data isolated.
+
+## Downstream API Contract Changes
+
+If a downstream team changes an API response without notice, I would handle it in two tracks.
+
+Technically:
+
+- deserialize into strict DTOs
+- validate required fields
+- fail fast when the response violates the expected contract
+- add contract tests or integration tests for critical downstream calls
+- add defensive metrics and alerts for deserialization or validation failures
+
+Communication/process:
+
+- clarify the change with the downstream team
+- agree on versioned APIs for breaking changes
+- document required fields and backward-compatible change rules
+- establish a rollout process so consumers are not surprised
+
+Adding fields is usually safe. Removing fields, renaming fields, or changing types should require a new version or an explicit migration plan.
+
+## Testing with JUnit and Mockito
+
+Unit tests should isolate business logic from infrastructure.
+
+```java
+@ExtendWith(MockitoExtension.class)
+class TaskServiceTest {
+    @Mock
+    private TaskRepository taskRepository;
+
+    @InjectMocks
+    private TaskService taskService;
+
+    @Test
+    void throwsWhenTaskDoesNotExist() {
+        when(taskRepository.findById(10L)).thenReturn(Optional.empty());
+
+        assertThrows(EntityNotFoundException.class, () -> taskService.getTask(10L));
+        verify(taskRepository).findById(10L);
+    }
+}
+```
+
+`@Mock` creates fake dependencies. `@InjectMocks` creates a real instance of the class under test and injects the mocks into it. Stubbing controls how a mock behaves. `verify` checks whether a dependency was called.
+
+A spy wraps a real object and calls real methods by default. It can selectively stub specific methods:
+
+```java
+TaskService spyService = spy(realService);
+doReturn(mockResult).when(spyService).expensiveLookup(any());
+```
+
+Spies are useful for legacy code, but they should be used carefully. Mocks are usually clearer when isolating external dependencies.
+
+## Integration Testing
+
+`@SpringBootTest` starts the Spring application context and is useful when testing wiring, configuration, or full request flow.
+
+`@WebMvcTest` loads only the MVC layer and is faster for controller tests.
+
+```java
+@WebMvcTest(TaskController.class)
+class TaskControllerTest {
+    @Autowired
+    private MockMvc mockMvc;
+
+    @MockBean
+    private TaskService taskService;
+
+    @Test
+    void returnsTask() throws Exception {
+        when(taskService.getTask(1L)).thenReturn(new TaskResponse(1L, "Review"));
+
+        mockMvc.perform(get("/api/tasks/1"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.title").value("Review"));
+    }
+}
+```
+
+For database integration, Testcontainers is often a better choice than mocking JPA behavior when SQL, schema, or transactions matter.
+
+## Actuator and Production Readiness
+
+Spring Boot Actuator exposes operational endpoints such as health, metrics, and application info.
+
+Useful endpoints:
+
+- `/actuator/health`
+- `/actuator/info`
+- `/actuator/metrics`
+- `/actuator/prometheus`, when Prometheus support is configured
+
+Production services should expose only the endpoints needed by infrastructure and should protect sensitive endpoints.
+
+```properties
+management.endpoints.web.exposure.include=health,info,metrics
+management.endpoint.health.probes.enabled=true
+```
+
+Readiness and liveness probes are especially important in container platforms such as Kubernetes.
+
+## Review Checklist
+
+Questions I should be able to answer clearly:
+
+- What problem does IoC solve?
+- Why is constructor injection preferred?
+- How does `DispatcherServlet` route a request to a controller?
+- When should I use `@PathVariable`, `@RequestParam`, and `@RequestBody`?
+- Why separate DTOs from entities?
+- What does `@Transactional` protect?
+- How do Spring Data JPA, Hibernate, JDBC, and the database driver fit together?
+- What does Spring Security store in `SecurityContextHolder`?
+- When should I use `@WebMvcTest` instead of `@SpringBootTest`?
+- What production information should Actuator expose?
+

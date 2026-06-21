@@ -1,7 +1,669 @@
 ---
 title: Java 8 Concurrency
-description: Concurrency primitives and patterns in Java.
+description: Study notes on Java 8 language features, streams, executors, futures, synchronization, atomics, locks, and concurrent collections.
 template: doc
 ---
 
-Planned coverage: threads, executors, futures, locks, atomics, and common pitfalls.
+These are my study-in-public notes for Java 8 language features and Java concurrency. I use this page to connect clean Java style with practical backend concerns: null safety, functional programming, stream pipelines, thread pools, shared state, visibility, locking, and concurrent data structures.
+
+## Optional
+
+`Optional<T>` was introduced in Java 8 as a container that may or may not hold a non-null value. It makes absence explicit and helps avoid scattered null checks.
+
+I use `Optional` mainly as a return type when absence is a normal outcome.
+
+```java
+Optional<ExpectedInventory> expectedInventory = repository.findExpectedInventory(skuId);
+
+int expectedCount = expectedInventory
+    .map(ExpectedInventory::getCount)
+    .orElse(0);
+```
+
+`Optional.of(value)` requires a non-null value. `Optional.ofNullable(value)` accepts a nullable value and returns `Optional.empty()` when the value is null.
+
+Good uses:
+
+- repository lookups that may not find a record
+- external data that may legitimately be missing
+- transformation pipelines using `map`, `flatMap`, `filter`, and `orElseGet`
+
+Avoid:
+
+- using `Optional` for fields in entities or DTOs
+- using `Optional.get()` without checking presence
+- wrapping collections in `Optional`; an empty collection is usually clearer
+
+## Functional Interfaces
+
+A functional interface has exactly one abstract method. Lambdas work because Java can map the lambda body to that single abstract method.
+
+`@FunctionalInterface` is optional, but useful. It lets the compiler verify that the interface still has only one abstract method.
+
+```java
+@FunctionalInterface
+interface InventoryRule {
+    boolean matches(InventoryEvent event);
+}
+
+InventoryRule returnEvent = event -> event.type() == EventType.RETURN;
+```
+
+Common built-in functional interfaces:
+
+| Interface | Shape | Example Use |
+| --- | --- | --- |
+| `Supplier<T>` | no input, returns `T` | lazy loading |
+| `Consumer<T>` | accepts `T`, returns nothing | event handling |
+| `Predicate<T>` | accepts `T`, returns boolean | filtering |
+| `Function<T, R>` | accepts `T`, returns `R` | mapping |
+| `BiFunction<T, U, R>` | accepts two inputs, returns `R` | combining values |
+
+```java
+Supplier<InventorySnapshot> loader = () -> loadFromCassandra();
+Consumer<InventoryEvent> handler = event -> process(event);
+Predicate<InventoryEvent> isReturn = event -> event.type() == EventType.RETURN;
+Function<InventoryEvent, String> skuId = InventoryEvent::skuId;
+```
+
+## Lambdas and Effectively Final Variables
+
+A lambda is a concise implementation of a functional interface.
+
+```java
+events.stream()
+    .filter(event -> event.type() == EventType.RETURN)
+    .map(InventoryEvent::skuId)
+    .toList();
+```
+
+Variables captured from outside the lambda must be final or effectively final. A variable is effectively final when it is assigned once and never reassigned.
+
+This matters because lambdas may execute later or on another thread. Java avoids capturing changing local variables because that would make lifetime and visibility harder to reason about.
+
+Bad pattern:
+
+```java
+int count = 0;
+events.forEach(event -> count++); // Does not compile.
+```
+
+Better patterns:
+
+```java
+long count = events.stream()
+    .filter(event -> event.type() == EventType.RETURN)
+    .count();
+```
+
+Or move mutable state into a domain object:
+
+```java
+InventoryState state = new InventoryState(skuId);
+events.forEach(state::apply);
+```
+
+The outside variable stays stable. The domain object owns its own state changes.
+
+## Method References
+
+Method references are syntax sugar for lambdas when the method call is already clear.
+
+| Form | Example | Lambda Equivalent |
+| --- | --- | --- |
+| Static method | `Person::isAdult` | `p -> Person.isAdult(p)` |
+| Bound instance method | `tom::equals` | `p -> tom.equals(p)` |
+| Unbound instance method | `Person::getAge` | `p -> p.getAge()` |
+| Constructor | `Person::new` | `() -> new Person()` |
+
+Use method references when they improve readability. When overloads or extra logic make intent unclear, a lambda is better.
+
+## Stream API
+
+A stream is a pipeline for processing data from a source such as a collection.
+
+Streams do not store data, and they do not modify the original collection by default. Intermediate operations are lazy. The pipeline runs only when a terminal operation is called.
+
+Intermediate operations:
+
+- `filter`
+- `map`
+- `flatMap`
+- `sorted`
+- `limit`
+- `distinct`
+- `peek`
+
+Terminal operations:
+
+- `collect`
+- `forEach`
+- `reduce`
+- `min`
+- `max`
+- `count`
+- `anyMatch`
+- `allMatch`
+- `noneMatch`
+
+Example:
+
+```java
+Map<String, Long> returnCountBySku = events.stream()
+    .filter(event -> event.type() == EventType.RETURN)
+    .collect(Collectors.groupingBy(
+        InventoryEvent::skuId,
+        Collectors.counting()
+    ));
+```
+
+Collections store data. Streams describe computation.
+
+## `map`, `flatMap`, and `reduce`
+
+`map` transforms each element one-to-one.
+
+```java
+List<String> skuIds = events.stream()
+    .map(InventoryEvent::skuId)
+    .toList();
+```
+
+`flatMap` flattens nested structures.
+
+```java
+List<String> allTags = products.stream()
+    .flatMap(product -> product.tags().stream())
+    .distinct()
+    .toList();
+```
+
+`reduce` combines elements into a single result.
+
+```java
+int totalQuantity = quantities.stream()
+    .reduce(0, Integer::sum);
+```
+
+For most collection-building work, `collect` is clearer than `reduce`.
+
+## Parallel Streams
+
+Parallel streams can split work across the common ForkJoinPool, but they are not a free performance upgrade.
+
+They are reasonable when:
+
+- the data set is large
+- each element is CPU-heavy
+- operations are independent and stateless
+- no blocking I/O is involved
+
+They are risky when:
+
+- the pipeline mutates shared state
+- operations call databases or remote APIs
+- ordering matters
+- the application already uses the common pool heavily
+
+For backend services, I prefer explicit executors when concurrency policy matters.
+
+## Process, Thread, Concurrency, and Parallelism
+
+A process is a running program with its own address space and system resources.
+
+A thread is the smallest unit of execution inside a process. Threads share process memory, but each thread has its own stack and program counter.
+
+Concurrency means multiple tasks are in progress during the same time period. Parallelism means multiple tasks are literally executing at the same time, usually on multiple CPU cores.
+
+Shared mutable state is where concurrency bugs usually start. If multiple threads can read and write the same data, the code needs a clear safety strategy.
+
+## Creating Threads
+
+Java can create threads directly:
+
+```java
+Thread thread = new Thread(() -> processEvents());
+thread.start();
+```
+
+In production code, I usually avoid creating raw threads directly. `ExecutorService` separates task definition from thread management and gives better control over concurrency.
+
+```java
+ExecutorService executor = Executors.newFixedThreadPool(4);
+
+Future<Integer> future = executor.submit(() -> calculateInventoryDelta());
+
+try {
+    Integer delta = future.get();
+} finally {
+    executor.shutdown();
+}
+```
+
+## Runnable vs Callable
+
+`Runnable` does not return a result and cannot throw checked exceptions from `run`.
+
+```java
+Runnable task = () -> refreshCache();
+```
+
+`Callable<V>` returns a value and can throw checked exceptions.
+
+```java
+Callable<Integer> task = () -> calculateInventoryDelta();
+```
+
+`Callable` is commonly submitted to an executor and represented by a `Future`.
+
+## ExecutorService
+
+`ExecutorService` manages a pool of worker threads and a queue of submitted tasks.
+
+Common executors:
+
+| Executor | Use Case | Caution |
+| --- | --- | --- |
+| `newSingleThreadExecutor` | Sequential background work. | One slow task blocks all later tasks. |
+| `newFixedThreadPool` | Controlled concurrency. | Queue can grow if producers are faster than workers. |
+| `newCachedThreadPool` | Short-lived bursty tasks. | Can create many threads under load. |
+| `newScheduledThreadPool` | Delayed or periodic tasks. | Tasks must handle exceptions carefully. |
+
+For serious services, prefer constructing `ThreadPoolExecutor` directly so queue size, thread count, rejection policy, and thread names are explicit.
+
+```java
+ExecutorService executor = new ThreadPoolExecutor(
+    4,
+    8,
+    60,
+    TimeUnit.SECONDS,
+    new ArrayBlockingQueue<>(100),
+    new ThreadPoolExecutor.CallerRunsPolicy()
+);
+```
+
+Always shut down executors owned by the application.
+
+```java
+executor.shutdown();
+if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
+    executor.shutdownNow();
+}
+```
+
+## Future and CompletableFuture
+
+`Future` represents the result of an asynchronous computation, but its composition model is limited. Calling `get()` blocks.
+
+`CompletableFuture` adds non-blocking composition.
+
+```java
+CompletableFuture<InventorySnapshot> actualFuture =
+    CompletableFuture.supplyAsync(() -> loadActualInventory(skuId), executor);
+
+CompletableFuture<ExpectedInventory> expectedFuture =
+    CompletableFuture.supplyAsync(() -> loadExpectedInventory(skuId), executor);
+
+CompletableFuture<InventoryView> viewFuture = actualFuture.thenCombine(
+    expectedFuture,
+    (actual, expected) -> InventoryView.merge(actual, expected)
+);
+```
+
+Useful operations:
+
+- `thenApply`: transform a successful result
+- `thenCompose`: chain another async operation
+- `thenCombine`: combine two independent async results
+- `exceptionally`: recover from failure
+- `handle`: inspect success or failure
+- `allOf`: wait for multiple futures
+
+Avoid using the common pool blindly for blocking I/O. Provide an executor that matches the workload.
+
+## Race Conditions
+
+A race condition happens when correctness depends on the timing of thread execution.
+
+```java
+count++; // read, modify, write
+```
+
+`count++` is not atomic. Two threads can read the same old value, both increment it, and one update is lost.
+
+Fix options:
+
+- use `synchronized` or a lock around the critical section
+- use atomic classes for simple single-variable updates
+- avoid shared mutable state
+- use message passing or immutable data structures
+
+## Java Memory Model: Visibility and Ordering
+
+The Java Memory Model defines when changes made by one thread become visible to another thread.
+
+Two problems matter most in day-to-day code:
+
+- **Visibility**: one thread updates a value, but another thread keeps reading an old cached value.
+- **Ordering**: the compiler, CPU, or JVM may reorder instructions as long as single-threaded behavior is preserved.
+
+Synchronization tools such as `synchronized`, `volatile`, locks, thread start/join, and concurrent collections create happens-before relationships. A happens-before relationship guarantees visibility and ordering between operations.
+
+## `synchronized`
+
+`synchronized` uses an object's monitor lock. A thread must acquire the monitor before entering a synchronized method or block.
+
+```java
+public class InventoryCounter {
+    private int count;
+
+    public synchronized void increment() {
+        count++;
+    }
+
+    public synchronized int getCount() {
+        return count;
+    }
+}
+```
+
+`synchronized` provides mutual exclusion and visibility. When one thread exits a synchronized block, changes made inside it become visible to a later thread that enters a block protected by the same monitor.
+
+Important detail: `synchronized` does not lock "the code." It locks the monitor associated with an object.
+
+## `volatile`
+
+`volatile` guarantees visibility and prevents certain instruction reordering, but it does not make compound operations atomic.
+
+Good use:
+
+```java
+private volatile boolean running = true;
+
+void stop() {
+    running = false;
+}
+
+void runLoop() {
+    while (running) {
+        processOneBatch();
+    }
+}
+```
+
+Bad use:
+
+```java
+private volatile int count;
+
+void increment() {
+    count++; // Still not atomic.
+}
+```
+
+For counters, use `AtomicInteger`, `LongAdder`, or a lock.
+
+`volatile` is also important in double-checked locking because object creation is not a single conceptual step. Without `volatile`, another thread could observe a reference before the object is fully initialized.
+
+```java
+public class ClientRegistry {
+    private static volatile ClientRegistry instance;
+
+    public static ClientRegistry getInstance() {
+        if (instance == null) {
+            synchronized (ClientRegistry.class) {
+                if (instance == null) {
+                    instance = new ClientRegistry();
+                }
+            }
+        }
+        return instance;
+    }
+}
+```
+
+In modern Spring applications, singleton beans usually remove the need to write this pattern manually.
+
+## wait, notify, and notifyAll
+
+`wait`, `notify`, and `notifyAll` coordinate threads that share a monitor.
+
+- `wait()` releases the monitor and suspends the current thread.
+- `notify()` wakes one waiting thread.
+- `notifyAll()` wakes all waiting threads.
+
+Always call `wait()` inside a loop that checks the condition.
+
+```java
+synchronized (lock) {
+    while (queue.isEmpty()) {
+        lock.wait();
+    }
+    item = queue.remove();
+}
+```
+
+In new code, higher-level utilities such as `BlockingQueue`, `CountDownLatch`, and `Condition` are usually easier to use correctly.
+
+## Atomic Classes and CAS
+
+Atomic classes provide lock-free thread-safe operations on single variables.
+
+```java
+AtomicInteger count = new AtomicInteger();
+count.incrementAndGet();
+```
+
+They use CAS, which stands for compare-and-swap. CAS updates a value only if the current value still matches the expected value.
+
+CAS avoids blocking and context switching, but under high contention it can spin and waste CPU.
+
+The ABA problem happens when a value changes from A to B and back to A. A CAS operation may see A and assume nothing changed. Java provides tools such as `AtomicStampedReference` when version tracking matters.
+
+For high-contention counters, `LongAdder` can perform better than `AtomicLong` because it spreads updates across multiple cells and combines them when read.
+
+```java
+LongAdder requests = new LongAdder();
+requests.increment();
+long total = requests.sum();
+```
+
+## Locks
+
+A lock protects a critical section so only one thread can access shared state at a time.
+
+`ReentrantLock` is an explicit lock. It supports features that `synchronized` does not expose directly, such as `tryLock`, interruptible lock acquisition, optional fairness, and multiple `Condition` objects.
+
+```java
+private final ReentrantLock lock = new ReentrantLock();
+
+void updateInventory() {
+    lock.lock();
+    try {
+        applyUpdate();
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+Always unlock in a `finally` block.
+
+## ReadWriteLock and StampedLock
+
+`ReadWriteLock` allows multiple concurrent readers but only one writer.
+
+```java
+private final ReadWriteLock lock = new ReentrantReadWriteLock();
+
+InventoryView readView() {
+    lock.readLock().lock();
+    try {
+        return currentView;
+    } finally {
+        lock.readLock().unlock();
+    }
+}
+
+void update(InventoryView next) {
+    lock.writeLock().lock();
+    try {
+        currentView = next;
+    } finally {
+        lock.writeLock().unlock();
+    }
+}
+```
+
+It is useful for read-heavy workloads. If writes are frequent, the overhead may not be worth it.
+
+`StampedLock` supports optimistic reads and can perform well in advanced read-heavy cases, but it is more complex and easier to misuse.
+
+## Coordination Utilities
+
+Java provides higher-level concurrency tools that are usually safer than manual wait/notify.
+
+| Tool | Purpose |
+| --- | --- |
+| `Semaphore` | Limits how many threads can access a resource at once. |
+| `CountDownLatch` | Lets threads wait until a one-time set of operations completes. |
+| `CyclicBarrier` | Lets a group of threads wait for each other at a reusable barrier. |
+| `BlockingQueue` | Coordinates producers and consumers with built-in blocking behavior. |
+
+Example with `CountDownLatch`:
+
+```java
+CountDownLatch latch = new CountDownLatch(3);
+
+for (int i = 0; i < 3; i++) {
+    executor.submit(() -> {
+        try {
+            loadPartition();
+        } finally {
+            latch.countDown();
+        }
+    });
+}
+
+latch.await();
+```
+
+## BlockingQueue: Producer and Consumer
+
+`BlockingQueue` is a clean way to connect producer and consumer threads.
+
+```java
+BlockingQueue<InventoryEvent> queue = new ArrayBlockingQueue<>(1000);
+
+executor.submit(() -> {
+    while (running) {
+        InventoryEvent event = queue.take();
+        process(event);
+    }
+});
+
+queue.put(new InventoryEvent("sku-1", 3));
+```
+
+The queue provides backpressure. If the queue is full, producers wait instead of growing memory without limit.
+
+## ConcurrentHashMap vs HashMap
+
+`HashMap` is not thread-safe. It is fine for local variables, single-threaded use, or externally synchronized access. It should not be used for concurrent writes.
+
+`ConcurrentHashMap` supports safe concurrent access. In Java 8 and later, it does not use the old Java 7 segment-lock design. It uses a mix of volatile reads, CAS, synchronized locking on individual bins during contention, and cooperative resizing.
+
+Important differences:
+
+| Behavior | HashMap | ConcurrentHashMap |
+| --- | --- | --- |
+| Thread safety | Not thread-safe | Thread-safe for individual operations |
+| Null keys/values | Allows one null key and null values | Does not allow null keys or null values |
+| Iteration | Fail-fast best effort | Weakly consistent |
+| Concurrent writes | Unsafe | Supported |
+
+`ConcurrentHashMap` rejects nulls to avoid ambiguity. In a concurrent map, `get(key) == null` must clearly mean the key is absent. If null values were allowed, a thread could not reliably distinguish "missing" from "present with null" while other threads are modifying the map.
+
+For compound updates, use atomic map APIs:
+
+```java
+counts.merge(skuId, 1, Integer::sum);
+```
+
+```java
+cache.computeIfAbsent(skuId, id -> loadSnapshot(id));
+```
+
+## ThreadLocal
+
+`ThreadLocal` stores a value separately for each thread.
+
+Spring Security uses this idea in the traditional servlet model through `SecurityContextHolder`, so the current request's authentication is available during request processing.
+
+Use `ThreadLocal` carefully in thread pools. Worker threads are reused, so values must be cleared to avoid leaking request data into later tasks.
+
+```java
+try {
+    requestContext.set(context);
+    handleRequest();
+} finally {
+    requestContext.remove();
+}
+```
+
+## Garbage Collection and OOM
+
+Garbage collection identifies objects that are no longer reachable and reclaims memory.
+
+The heap is often discussed as young generation and old generation. Short-lived objects are usually allocated in the young generation and collected by minor GCs. Objects that survive long enough may be promoted to the old generation.
+
+`OutOfMemoryError` happens when the JVM cannot allocate memory. A common cause is a memory leak: objects are no longer useful, but they are still reachable from active references.
+
+Example:
+
+```java
+private static final Map<String, Transaction> history = new HashMap<>();
+```
+
+If this map grows forever and entries are never evicted, the garbage collector cannot reclaim those objects.
+
+For caches, use bounded size, expiration, or a cache library with eviction policies.
+
+## JIT and Warm-Up
+
+Java source code compiles to bytecode. At runtime, the JVM starts by interpreting bytecode. The Just-In-Time compiler watches for hot code paths and compiles them into optimized machine code.
+
+This is one reason Java services often improve after warm-up. Frequently executed methods become optimized over time.
+
+For performance testing, warm-up matters. Measuring only the first few seconds of a JVM process can produce misleading results.
+
+## Practical Concurrency Checklist
+
+Questions I should ask before writing concurrent code:
+
+- What shared state exists?
+- Which thread owns each piece of state?
+- Do I need mutual exclusion, visibility, atomicity, or coordination?
+- Can I use immutable objects or message passing instead of shared mutation?
+- Is the task CPU-bound or I/O-bound?
+- What executor owns the work, and how is it shut down?
+- What happens when the queue is full?
+- Are timeouts and cancellation handled?
+- Are errors observed, logged, and propagated?
+
+## Review Checklist
+
+Questions I should be able to answer clearly:
+
+- When should a method return `Optional`?
+- Why do captured lambda variables need to be effectively final?
+- What is the difference between `map` and `flatMap`?
+- Why are stream operations lazy?
+- What is the difference between concurrency and parallelism?
+- Why is `volatile` not enough for `count++`?
+- What does `synchronized` lock?
+- How does CAS work, and what is the ABA problem?
+- When should I use `ConcurrentHashMap.computeIfAbsent` or `merge`?
+- Why should an executor be shut down explicitly?
+- When is `CompletableFuture` better than `Future`?
+
