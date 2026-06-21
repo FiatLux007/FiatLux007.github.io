@@ -1,7 +1,383 @@
 ---
 title: Java Fundamentals
-description: Core Java language and tooling notes.
+description: Study notes on core Java language features, memory, collections, exceptions, and everyday backend interview topics.
 template: doc
 ---
 
-Work in progress: language essentials, collections, I/O, and best practices for Java in production.
+These are my working notes for reviewing core Java. I am writing them as a study-in-public page: concise enough to revise from, but detailed enough to explain the reasoning behind each concept.
+
+## Object-Oriented Programming
+
+Object-oriented programming models software around classes and objects.
+
+A **class** is a blueprint for data and behavior. In Java, fields describe the state of an object, and methods describe what the object can do. An **object** is an instance of a class.
+
+Java's four core OOP principles are encapsulation, inheritance, polymorphism, and abstraction.
+
+### Encapsulation
+
+Encapsulation means hiding internal state and exposing controlled access through methods.
+
+In practice, this often means:
+
+- keeping fields `private`
+- validating updates through constructors or setter methods
+- exposing behavior instead of letting other classes manipulate raw state directly
+
+The goal is not just "data hiding." It is keeping an object's invariants protected.
+
+### Inheritance
+
+Inheritance lets a subclass reuse and specialize behavior from a parent class. In Java, a class uses `extends` to inherit from another class.
+
+Inheritance works best for a clear "is-a" relationship. If the relationship is mostly about sharing behavior, composition is often cleaner than building a deep inheritance tree.
+
+### Polymorphism
+
+Polymorphism allows the same method call to behave differently depending on the actual runtime type of the object.
+
+Java supports two common forms:
+
+- **Method overriding**: a subclass provides its own implementation of a method defined by a superclass. The method name, parameters, and compatible return type must match. The JVM decides which method to run at runtime based on the actual object type.
+- **Method overloading**: multiple methods in the same class share the same name but have different parameter lists. The compiler resolves the call at compile time.
+
+```java
+Animal animal = new Dog();
+animal.speak(); // Calls Dog's implementation at runtime.
+```
+
+### Abstraction
+
+Abstraction hides implementation details and exposes only the behavior a caller needs.
+
+In Java, abstraction is usually expressed through abstract classes and interfaces.
+
+## Abstract Classes vs Interfaces
+
+Both abstract classes and interfaces can model abstraction, but they communicate different design intent.
+
+An **abstract class** is useful when related classes share state or base behavior. It can have constructors, instance fields, concrete methods, abstract methods, and different access modifiers. A Java class can extend only one class, so this creates a tighter relationship.
+
+An **interface** is closer to a contract. It defines what a type can do without requiring a shared class hierarchy. A class can implement multiple interfaces, which gives Java a form of multiple inheritance for behavior.
+
+Since Java 8, interfaces can include `default` and `static` methods. Interface fields are implicitly `public static final`, and interface methods are generally public unless they are private helper methods introduced in later Java versions.
+
+My rule of thumb:
+
+- Use an interface when defining a capability or contract.
+- Use an abstract class when subclasses need shared state, constructors, or common implementation.
+
+## Comparable vs Comparator
+
+`Comparable` and `Comparator` both define ordering, but they belong in different places.
+
+`Comparable<T>` defines a type's natural ordering. It is implemented inside the class by overriding `compareTo`.
+
+```java
+final class Student implements Comparable<Student> {
+    private final String name;
+    private final int score;
+
+    Student(String name, int score) {
+        this.name = name;
+        this.score = score;
+    }
+
+    @Override
+    public int compareTo(Student other) {
+        return Integer.compare(this.score, other.score);
+    }
+}
+```
+
+`Comparator<T>` defines an external ordering strategy. It is useful when a class needs more than one sort order, or when the class should not own the sorting logic.
+
+```java
+List<String> names = Arrays.asList("Apple", "Banana", "Cherry", "Date");
+
+names.sort(Comparator.comparingInt(String::length));
+
+System.out.println(names); // [Date, Apple, Banana, Cherry]
+```
+
+Important detail: `Comparable` has a semantic contract with equality. It is strongly recommended that `x.compareTo(y) == 0` should be consistent with `x.equals(y)`. If it is not, sorted collections such as `TreeSet` and `TreeMap` can behave in surprising ways.
+
+## Access Modifiers
+
+Java has four main access levels:
+
+| Modifier | Access |
+| --- | --- |
+| `private` | Same class only |
+| package-private | Same package; this is the default when no modifier is written |
+| `protected` | Same package, plus subclasses even across packages |
+| `public` | Anywhere |
+
+Access modifiers are part of API design. The smaller the exposed surface area, the easier the code is to change safely.
+
+## `static`
+
+`static` defines class-level members instead of instance-level members.
+
+A static field belongs to the class and is shared by all instances. A static method can be called without creating an object, but it cannot directly access instance fields because it is not tied to a specific object.
+
+Common uses:
+
+- constants, usually with `static final`
+- utility methods
+- factory methods
+- counters or shared configuration, when shared mutable state is truly needed
+
+## `final`
+
+`final` restricts modification.
+
+- A `final` variable cannot be reassigned.
+- A `final` method cannot be overridden.
+- A `final` class cannot be extended.
+
+`final` is often used to make code easier to reason about. It does not automatically make an object immutable; it only prevents the variable from pointing to a different object.
+
+For example, a `final List<String>` can still have elements added to it unless the list itself is immutable.
+
+## Constructors and `super()`
+
+A constructor initializes an object when it is created. It has the same name as the class and no return type.
+
+`super()` calls the parent class constructor. In a subclass constructor, it must be the first statement. This ensures the parent portion of the object is initialized before the subclass adds its own state.
+
+## Stack vs Heap
+
+The **stack** stores method call frames. Each frame contains local variables, primitive values, and object references for the current method call. When the method returns, its frame is removed.
+
+The **heap** stores objects and arrays created at runtime. References to those objects may live on the stack, in object fields, or in static fields. Heap memory is managed by the garbage collector.
+
+The stack is thread-private. The heap is shared across threads, which is why objects stored there require careful synchronization when they are mutable and accessed concurrently.
+
+## Shallow Copy vs Deep Copy
+
+A **shallow copy** copies primitive values and object references. The new object still points to the same nested objects as the original.
+
+A **deep copy** creates new copies of the nested objects as well, so changes to the copy do not affect the original object graph.
+
+Java does not provide a universal deep-copy mechanism. Options include copy constructors, factory methods, serialization-based approaches, or manual copying of each nested field. In production code, explicit copy constructors or immutable objects are usually easier to maintain than relying on `clone()`.
+
+## `StringBuilder` vs `StringBuffer`
+
+Both `StringBuilder` and `StringBuffer` build mutable character sequences.
+
+- `StringBuilder` is not synchronized, so it is faster in single-threaded code.
+- `StringBuffer` is synchronized, so individual operations are thread-safe, but it is usually slower.
+
+In most modern Java code, `StringBuilder` is the default choice unless shared mutation across threads is required.
+
+## JVM Memory Model: Practical View
+
+The JVM divides runtime data into thread-private and shared areas.
+
+Thread-private areas:
+
+- **Java stack**: stores stack frames for method calls.
+- **PC register**: tracks the current instruction for a thread.
+- **Native method stack**: supports native code execution.
+
+Shared areas:
+
+- **Heap**: stores object instances and arrays.
+- **Method area / Metaspace**: stores class metadata. Since Java 8, class metadata is stored in Metaspace, which uses native memory instead of the old Permanent Generation.
+
+The heap is commonly discussed in terms of young and old generations because many garbage collectors optimize for the observation that most objects die young.
+
+## Garbage Collection
+
+Garbage collection reclaims heap memory from objects that are no longer reachable.
+
+At a high level, many collectors use a variation of this flow:
+
+1. **Mark** reachable objects from GC roots.
+2. **Sweep** memory occupied by unreachable objects.
+3. **Compact** live objects to reduce fragmentation, depending on the collector.
+
+A **memory leak** in Java usually means an object is no longer useful but is still reachable through some reference. Because the garbage collector sees it as reachable, it cannot reclaim the memory. Over time, this can cause performance degradation and eventually an `OutOfMemoryError`.
+
+Common leak sources:
+
+- static collections that keep growing
+- listeners or callbacks that are never unregistered
+- caches without eviction policies
+- thread-local values that are not cleared in pooled threads
+
+## HashMap
+
+A `HashMap` stores key-value pairs and uses hashing to make common operations such as `get`, `put`, `remove`, and `containsKey` close to `O(1)` on average.
+
+The simplified lookup process is:
+
+1. Call `hashCode()` on the key.
+2. Spread the hash to reduce poor hash distribution.
+3. Calculate the bucket index.
+4. Search that bucket using `equals()` to find the matching key.
+
+If two keys map to the same bucket, a hash collision occurs. Java handles collisions with separate chaining. In Java 8 and later, when a bucket becomes large enough, and the table is large enough, the bucket can be transformed from a linked list into a red-black tree. This improves worst-case lookup behavior from `O(n)` to `O(log n)` for that bucket.
+
+## Why Override `equals()` and `hashCode()` Together?
+
+Hash-based collections rely on both methods.
+
+- `hashCode()` chooses the bucket.
+- `equals()` identifies the exact key inside that bucket.
+
+If two objects are equal according to `equals()`, they must return the same hash code. Otherwise, a `HashMap` may look in the wrong bucket and fail to find a logically equal key.
+
+Example:
+
+```java
+Map<UserId, String> names = new HashMap<>();
+
+names.put(new UserId(42), "Eva");
+names.get(new UserId(42)); // Works only if equals() and hashCode() are consistent.
+```
+
+The contract matters more than the implementation style. Records are useful here because Java can generate value-based `equals()` and `hashCode()` automatically.
+
+## HashMap, Hashtable, TreeMap, and LinkedHashMap
+
+| Type | Ordering | Thread Safety | Null Support | Typical Use |
+| --- | --- | --- | --- | --- |
+| `HashMap` | No guaranteed order | Not thread-safe | Allows one null key and null values | General-purpose map |
+| `LinkedHashMap` | Maintains insertion order, or access order when configured | Not thread-safe | Allows nulls | Ordered iteration, simple LRU cache patterns |
+| `TreeMap` | Sorted by natural order or a comparator | Not thread-safe | Null key depends on comparator; null values allowed | Sorted keys and range queries |
+| `Hashtable` | No guaranteed order | Synchronized | Does not allow null keys or values | Legacy code; usually avoid in new code |
+
+`Hashtable` synchronizes its methods, which reduces concurrency and does not compose well for compound operations. In modern Java, prefer `ConcurrentHashMap` for concurrent maps.
+
+## ConcurrentHashMap
+
+`ConcurrentHashMap` is designed for concurrent access without locking the entire map for every operation.
+
+Older explanations often describe it as segment-based locking. That was accurate for older Java versions, but Java 8 changed the implementation. Modern `ConcurrentHashMap` uses a combination of CAS operations, synchronized blocks on individual bins during contention, and cooperative resizing.
+
+Practical takeaway:
+
+- Use `ConcurrentHashMap` when multiple threads read and update a shared map.
+- Do not use `HashMap` for concurrent writes.
+- Remember that individual operations are thread-safe, but multi-step logic may still need atomic APIs such as `compute`, `computeIfAbsent`, or `merge`.
+
+```java
+counts.merge("java", 1, Integer::sum);
+```
+
+## Sets: HashSet vs TreeSet
+
+`HashSet` uses hashing and does not guarantee iteration order. It is usually the best default when uniqueness is the only requirement.
+
+`TreeSet` stores elements in sorted order using natural ordering or a provided comparator. Its operations are typically `O(log n)`.
+
+Use `TreeSet` when sorted iteration or range-style operations matter.
+
+## Java Collections Framework
+
+The Java Collections Framework provides interfaces and implementations for working with groups of objects.
+
+Common interfaces:
+
+- `List`: ordered collection that allows duplicates
+- `Set`: unique elements
+- `Queue`: elements processed in a queue-like order
+- `Map`: key-value associations; technically separate from `Collection`
+
+The interface should usually appear in variable and method types, while the implementation is chosen at construction time.
+
+```java
+List<String> names = new ArrayList<>();
+Set<String> uniqueNames = new HashSet<>();
+Map<String, Integer> scores = new HashMap<>();
+```
+
+## ArrayList vs LinkedList
+
+`ArrayList` is backed by a dynamic array. It provides fast indexed access.
+
+- `get(index)`: `O(1)`
+- inserting or removing in the middle: `O(n)`
+- appending at the end: amortized `O(1)`
+
+`LinkedList` is implemented as a doubly linked list.
+
+- `addFirst`, `addLast`, `removeFirst`, `removeLast`: `O(1)`
+- `get(index)`: `O(n)`
+- removing a known node through an iterator can be efficient, but finding the node still costs time
+
+In practice, `ArrayList` is the default for most list use cases because it is cache-friendly and simple. `LinkedList` is useful only for narrower cases, especially when queue/deque behavior is needed.
+
+## Exceptions and Errors
+
+Both `Exception` and `Error` extend `Throwable`.
+
+An **Error** represents a serious problem that applications usually should not try to recover from, such as `OutOfMemoryError` or `StackOverflowError`.
+
+An **Exception** represents a condition the application may handle.
+
+### Checked vs Unchecked Exceptions
+
+Checked exceptions are checked at compile time. A method must either handle them with `try/catch` or declare them with `throws`.
+
+Examples:
+
+- `IOException`
+- `SQLException`
+
+Unchecked exceptions extend `RuntimeException`. They are not checked at compile time and often represent programming mistakes or invalid assumptions.
+
+Examples:
+
+- `NullPointerException`
+- `IllegalArgumentException`
+- `ArrayIndexOutOfBoundsException`
+
+### `throw` vs `throws`
+
+`throw` is used inside a method to throw an exception.
+
+```java
+throw new IllegalArgumentException("score must be non-negative");
+```
+
+`throws` appears in a method signature to declare that the method may pass an exception to its caller.
+
+```java
+void readFile(Path path) throws IOException {
+    Files.readString(path);
+}
+```
+
+## Default Methods vs Static Methods in Interfaces
+
+A `default` method provides an implementation that implementing classes inherit and may override.
+
+A `static` method belongs to the interface itself. It is called through the interface name and is not overridden by implementing classes.
+
+```java
+interface Formatter {
+    default String normalize(String value) {
+        return value.trim();
+    }
+
+    static boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
+    }
+}
+```
+
+## Review Checklist
+
+Questions I should be able to answer without memorizing scripts:
+
+- When should I choose an interface instead of an abstract class?
+- Why must `equals()` and `hashCode()` be consistent?
+- What happens inside a `HashMap` when two keys collide?
+- Why is `ConcurrentHashMap` safer than `HashMap` under concurrent writes?
+- When is `ArrayList` a better default than `LinkedList`?
+- What is the difference between checked and unchecked exceptions?
+- How do stack references and heap objects relate to each other?
+
